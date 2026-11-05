@@ -1,0 +1,16 @@
+{
+  "name": "meeting-copilot",
+  "version": "0.1.0",
+  "description": "Screen-share-invisible meeting assistant: listens to your mic + pasted chat, suggests replies, solves coding/design questions.",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "sample": "node examples/api-sample.js"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^4.3.2"
+  }
+}
