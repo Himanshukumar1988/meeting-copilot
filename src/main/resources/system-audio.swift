@@ -1,51 +1,110 @@
 // Streams the Mac's system audio (everything you hear, e.g. a Meet call) to stdout as 16 kHz mono
-// little-endian float32 PCM. Uses ScreenCaptureKit (macOS 13+); needs Screen Recording permission.
+// little-endian float32 PCM, using a Core Audio process tap (macOS 14.2+). Needs the "System Audio
+// Recording" permission for the app that launched it. Errors go to stderr; exits non-zero on failure.
 import Foundation
-import ScreenCaptureKit
-import CoreMedia
+import CoreAudio
+import AudioToolbox
 
-final class Tap: NSObject, SCStreamOutput, SCStreamDelegate {
-    func stream(_ stream: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .audio, sb.isValid else { return }
-        var list = AudioBufferList()
-        var block: CMBlockBuffer?
-        let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
-            sb, bufferListSizeNeededOut: nil, bufferListOut: &list,
-            bufferListSize: MemoryLayout<AudioBufferList>.size, blockBufferAllocator: nil,
-            blockBufferMemoryAllocator: nil,
-            flags: kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment, blockBufferOut: &block)
-        guard status == noErr, let data = list.mBuffers.mData else { return }
-        FileHandle.standardOutput.write(Data(bytes: data, count: Int(list.mBuffers.mDataByteSize)))
-    }
+func fail(_ msg: String, _ status: OSStatus = 0) -> Never {
+    fputs("error: \(msg)\(status != 0 ? " (OSStatus \(status))" : "")\n", stderr)
+    exit(1)
+}
 
-    func stream(_ stream: SCStream, didStopWithError error: Error) {
-        fputs("stream stopped: \(error)\n", stderr)
-        exit(2)
+// 1. A global tap on all system output, mixed down to stereo, not muting what you hear.
+let tapDescription = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
+tapDescription.name = "meeting-copilot"
+tapDescription.isPrivate = true
+tapDescription.muteBehavior = .unmuted
+
+var tapID = AudioObjectID(kAudioObjectUnknown)
+var status = AudioHardwareCreateProcessTap(tapDescription, &tapID)
+guard status == noErr else {
+    fail("could not create the system audio tap; allow System Audio Recording for the app you launched from", status)
+}
+
+// 2. What format does the tap deliver?
+var formatAddress = AudioObjectPropertyAddress(mSelector: kAudioTapPropertyFormat,
+                                               mScope: kAudioObjectPropertyScopeGlobal,
+                                               mElement: kAudioObjectPropertyElementMain)
+var format = AudioStreamBasicDescription()
+var formatSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+status = AudioObjectGetPropertyData(tapID, &formatAddress, 0, nil, &formatSize, &format)
+guard status == noErr, format.mSampleRate > 0 else { fail("could not read the tap format", status) }
+let channels = max(1, Int(format.mChannelsPerFrame))
+let interleaved = (format.mFormatFlags & kAudioFormatFlagIsNonInterleaved) == 0
+fputs("tap format: \(format.mSampleRate) Hz, \(channels) ch, interleaved=\(interleaved)\n", stderr)
+
+// 3. A private aggregate device containing the tap, so we can attach an IO callback to it.
+let aggregate: [String: Any] = [
+    kAudioAggregateDeviceNameKey: "meeting-copilot-tap",
+    kAudioAggregateDeviceUIDKey: UUID().uuidString,
+    kAudioAggregateDeviceIsPrivateKey: true,
+    kAudioAggregateDeviceTapAutoStartKey: true,
+    kAudioAggregateDeviceTapListKey: [[
+        kAudioSubTapUIDKey: tapDescription.uuid.uuidString,
+        kAudioSubTapDriftCompensationKey: true,
+    ]],
+]
+var deviceID = AudioObjectID(kAudioObjectUnknown)
+status = AudioHardwareCreateAggregateDevice(aggregate as CFDictionary, &deviceID)
+guard status == noErr else { fail("could not create the aggregate device", status) }
+
+// 4. Mix to mono, box-filter down to 16 kHz, write to stdout.
+let step = format.mSampleRate / 16000.0
+var position = 0.0, accumulator: Float = 0, accumulated: Float = 0
+let stdout = FileHandle.standardOutput
+
+func consume(_ mono: Float, into out: inout [Float]) {
+    accumulator += mono
+    accumulated += 1
+    position += 1
+    if position >= step {
+        out.append(accumulator / accumulated)
+        position -= step
+        accumulator = 0
+        accumulated = 0
     }
 }
 
-let tap = Tap()
-Task {
-    do {
-        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-        guard let display = content.displays.first else { fputs("no display found\n", stderr); exit(1) }
-        let config = SCStreamConfiguration()
-        config.capturesAudio = true
-        config.sampleRate = 48000
-        config.channelCount = 1
-        config.excludesCurrentProcessAudio = true
-        config.width = 2          // we only want audio; keep the video side tiny
-        config.height = 2
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
-        let stream = SCStream(filter: SCContentFilter(display: display, excludingWindows: []),
-                              configuration: config, delegate: tap)
-        let queue = DispatchQueue(label: "audio")
-        try stream.addStreamOutput(tap, type: .audio, sampleHandlerQueue: queue)
-        try stream.addStreamOutput(tap, type: .screen, sampleHandlerQueue: queue) // ignored; avoids SCK warnings
-        try await stream.startCapture()
-    } catch {
-        fputs("error: \(error)\n", stderr)
-        exit(1)
+var procID: AudioDeviceIOProcID?
+let queue = DispatchQueue(label: "meeting-copilot.audio", qos: .userInteractive)
+status = AudioDeviceCreateIOProcIDWithBlock(&procID, deviceID, queue) { _, inputData, _, _, _ in
+    let buffers = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inputData))
+    var out = [Float]()
+    if interleaved {
+        guard let buffer = buffers.first, let raw = buffer.mData else { return }
+        let samples = raw.assumingMemoryBound(to: Float.self)
+        let frames = Int(buffer.mDataByteSize) / (MemoryLayout<Float>.size * channels)
+        for f in 0..<frames {
+            var sum: Float = 0
+            for c in 0..<channels { sum += samples[f * channels + c] }
+            consume(sum / Float(channels), into: &out)
+        }
+    } else {
+        let frames = buffers.first.map { Int($0.mDataByteSize) / MemoryLayout<Float>.size } ?? 0
+        for f in 0..<frames {
+            var sum: Float = 0
+            for b in buffers { if let raw = b.mData { sum += raw.assumingMemoryBound(to: Float.self)[f] } }
+            consume(sum / Float(max(1, buffers.count)), into: &out)
+        }
     }
+    if !out.isEmpty { out.withUnsafeBufferPointer { stdout.write(Data(buffer: $0)) } }
 }
+guard status == noErr, let proc = procID else { fail("could not create the audio callback", status) }
+
+status = AudioDeviceStart(deviceID, proc)
+guard status == noErr else { fail("could not start capturing", status) }
+fputs("started\n", stderr)
+
+// Clean up the tap when asked to stop.
+signal(SIGTERM, SIG_IGN)
+let stopper = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+stopper.setEventHandler {
+    AudioDeviceStop(deviceID, proc)
+    AudioDeviceDestroyIOProcID(deviceID, proc)
+    AudioHardwareDestroyAggregateDevice(deviceID)
+    AudioHardwareDestroyProcessTap(tapID)
+    exit(0)
+}
+stopper.resume()
 dispatchMain()

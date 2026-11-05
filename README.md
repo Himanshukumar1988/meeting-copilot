@@ -12,7 +12,7 @@ Overlay that suggests replies and solves coding/design questions during meetings
 ```
 cp .env.example .env        # set LLM_API_KEY
 mvn package
-java -jar target/meeting-copilot.jar
+./run.sh                    # runs a private copy of the jar, so you can rebuild while it runs
 java -cp target/meeting-copilot.jar examples/ApiSample.java "your question"   # standalone API sample
 ```
 
@@ -22,7 +22,7 @@ java -cp target/meeting-copilot.jar examples/ApiSample.java "your question"   # 
 Global hotkeys need **Accessibility** permission for the terminal that launches the app (System Settings → Privacy & Security). The mic needs Microphone permission. Hotkeys are not swallowed, so the focused app also sees them.
 
 ## Known limits
-- The default mic only hears you. To transcribe the other side of a call, choose **System audio (other side)** or **Mic + system audio** (lines are labelled `Me:` / `Them:`) in the dropdown above the transcript. This needs no virtual driver: a small Swift helper (ScreenCaptureKit) is compiled on first use into `.bin/` (needs Xcode command line tools) and requires *Screen & System Audio Recording* permission for the app you launch the jar from. A BlackHole/aggregate device also still works as a normal input.
+- The default mic only hears you. To transcribe the other side of a call, choose **System audio (other side)** or **Mic + system audio** (lines are labelled `Me:` / `Them:`) in the dropdown above the transcript. This needs no virtual driver: a small Swift helper (Core Audio process tap, macOS 14.2+) is compiled on first use into `.bin/` (needs Xcode command line tools) and requires the *System Audio Recording* permission for the app you launch the jar from. A BlackHole/aggregate device also still works as a normal input.
 - Screen-share hiding and click-through are macOS only.
 - The legacy Electron/Node version (`main.js`, `src/*.js`, `renderer/`) is still in the repo and can be deleted.
 

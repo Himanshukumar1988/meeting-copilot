@@ -3,7 +3,13 @@ package com.copilot;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.InterruptedIOException;
+import java.nio.charset.StandardCharsets;
+import java.util.function.Consumer;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -14,7 +20,16 @@ import java.util.Map;
 /** Client for the Paytm inference gateway chat endpoint. */
 public final class Llm {
     /** What the user wants suggested, plus the context gathered so far. */
-    public record Input(String mode, String transcript, String chat, String question, String imageDataUrl) {}
+    /**
+     * @param selection text the user highlighted in the transcript/chat/suggestion; when present it is the
+     *                  main subject and the transcript and chat are only background
+     */
+    public record Input(String mode, String transcript, String chat, String question, String imageDataUrl, String selection) {
+        /** Convenience for callers without a selection. */
+        public Input(String mode, String transcript, String chat, String question, String imageDataUrl) {
+            this(mode, transcript, chat, question, imageDataUrl, null);
+        }
+    }
 
     private static final Map<String, String> PROMPTS = Map.of(
         "reply",
@@ -35,15 +50,23 @@ public final class Llm {
     // Builds the chat messages for a mode from chat, transcript and an optional explicit question.
     static JsonArray buildMessages(Input in) {
         StringBuilder user = new StringBuilder();
-        append(user, "# Meeting chat", in.chat());
-        append(user, "# Live transcript (most recent last)", in.transcript());
+        boolean hasSelection = in.selection() != null && !in.selection().isBlank();
+        if (hasSelection) append(user, "# Selected text (work on THIS)", in.selection());
+        String background = hasSelection ? " (background only)" : "";
+        append(user, "# Meeting chat" + background, in.chat());
+        append(user, "# Live transcript (most recent last)" + background, in.transcript());
         append(user, "# User request", in.question());
         boolean hasImage = in.imageDataUrl() != null;
         if (user.isEmpty() && hasImage) user.append("# User request\nSolve or answer what the attached screenshot shows.");
         else if (user.isEmpty()) user.append("# User request\nNo context yet. Say what you need.");
 
         JsonArray messages = new JsonArray();
-        messages.add(message("system", PROMPTS.getOrDefault(in.mode(), PROMPTS.get("reply"))));
+        String system = PROMPTS.getOrDefault(in.mode(), PROMPTS.get("reply"));
+        if (hasSelection) {
+            system += " The user highlighted a passage under 'Selected text': base your answer on that passage, "
+                + "and use the other sections only as background context.";
+        }
+        messages.add(message("system", system));
         if (hasImage) {
             // OpenAI-style multimodal content: a text part plus an image_url part (data URL).
             JsonArray parts = new JsonArray();
@@ -82,19 +105,73 @@ public final class Llm {
 
     /** Sends one non-streaming request and returns the assistant text ("" if the reply has none). */
     public static String complete(Input in) throws IOException, InterruptedException {
-        Config.Settings cfg = Config.load();
-        if (in.imageDataUrl() != null) { // the default text model rejects image content; use a vision model
-            cfg = new Config.Settings(cfg.apiKey(), cfg.baseUrl(), Config.get("LLM_VISION_MODEL", "al-gpt-5"));
-        }
-        return chat(cfg, buildMessages(in));
+        return chat(settingsFor(in), buildMessages(in)); // the default text model rejects images, so settingsFor swaps it
     }
 
-    /** Low-level call shared with the standalone sample. */
-    public static String chat(Config.Settings cfg, JsonArray messages) throws IOException, InterruptedException {
+    /**
+     * Like {@link #complete} but streams: {@code onDelta} receives each new piece of answer text as it is
+     * generated (reasoning tokens are skipped). Returns the full text. Interrupting the thread cancels it.
+     */
+    public static String stream(Input in, Consumer<String> onDelta) throws IOException, InterruptedException {
+        Config.Settings cfg = settingsFor(in);
+        JsonObject body = requestBody(cfg, buildMessages(in));
+        body.addProperty("stream", true);
+        HttpRequest req = HttpRequest.newBuilder(URI.create(cfg.baseUrl() + "/ai/playground"))
+            .timeout(Duration.ofMinutes(2))
+            .header("Authorization", "Bearer " + cfg.apiKey())
+            .header("Content-Type", "application/json")
+            .POST(HttpRequest.BodyPublishers.ofString(body.toString()))
+            .build();
+        HttpResponse<InputStream> res = HTTP.send(req, HttpResponse.BodyHandlers.ofInputStream());
+        if (res.statusCode() / 100 != 2) {
+            String text = new String(res.body().readAllBytes(), StandardCharsets.UTF_8);
+            throw new IOException("LLM " + res.statusCode() + ": " + text.substring(0, Math.min(300, text.length())));
+        }
+        StringBuilder all = new StringBuilder();
+        try (BufferedReader r = new BufferedReader(new InputStreamReader(res.body(), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = r.readLine()) != null) {
+                if (Thread.currentThread().isInterrupted()) throw new InterruptedException();
+                if (!line.startsWith("data:")) continue;
+                String data = line.substring(5).strip();
+                if (data.equals("[DONE]")) break;
+                JsonArray choices = JsonParser.parseString(data).getAsJsonObject().getAsJsonArray("choices");
+                if (choices == null || choices.isEmpty()) continue;
+                JsonObject delta = choices.get(0).getAsJsonObject().getAsJsonObject("delta");
+                if (delta == null || !delta.has("content") || delta.get("content").isJsonNull()) continue;
+                String piece = delta.get("content").getAsString();
+                if (piece.isEmpty()) continue;
+                all.append(piece);
+                onDelta.accept(piece);
+            }
+        } catch (InterruptedIOException e) {
+            throw new InterruptedException();
+        } catch (IOException e) {
+            // HttpClient reports a thread interrupt during a body read as an IOException with this cause.
+            if (e.getCause() instanceof InterruptedException || Thread.currentThread().isInterrupted()) throw new InterruptedException();
+            throw e;
+        }
+        return all.toString();
+    }
+
+    // Text requests use the normal model; image requests need a vision-capable one.
+    private static Config.Settings settingsFor(Input in) {
+        Config.Settings cfg = Config.load();
+        if (in.imageDataUrl() == null) return cfg;
+        return new Config.Settings(cfg.apiKey(), cfg.baseUrl(), Config.get("LLM_VISION_MODEL", "al-gpt-5"));
+    }
+
+    private static JsonObject requestBody(Config.Settings cfg, JsonArray messages) {
         JsonObject body = new JsonObject();
         body.addProperty("model", cfg.model());
         body.add("messages", messages);
         body.addProperty("max_tokens", 4096);
+        return body;
+    }
+
+    /** Low-level call shared with the standalone sample. */
+    public static String chat(Config.Settings cfg, JsonArray messages) throws IOException, InterruptedException {
+        JsonObject body = requestBody(cfg, messages);
         body.addProperty("stream", false);
 
         HttpRequest req = HttpRequest.newBuilder(URI.create(cfg.baseUrl() + "/ai/playground"))

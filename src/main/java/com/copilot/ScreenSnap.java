@@ -11,7 +11,8 @@ import javax.imageio.ImageIO;
 
 /** Captures the primary screen and encodes it as a JPEG data URL for vision-capable models. */
 public final class ScreenSnap {
-    private static final int MAX_WIDTH = 1600;
+    private static final int MAX_WIDTH = 1600;      // keep small on-screen text (e.g. code) legible; size barely affects latency
+    private static final float JPEG_QUALITY = 0.8f;
 
     /** A captured image ready to send, plus its size for display. */
     public record Snap(String dataUrl, int width, int height) {}
@@ -55,8 +56,17 @@ public final class ScreenSnap {
     }
 
     private static byte[] toJpeg(BufferedImage img) throws IOException {
+        var writer = ImageIO.getImageWritersByFormatName("jpg").next();
+        var param = writer.getDefaultWriteParam();
+        param.setCompressionMode(javax.imageio.ImageWriteParam.MODE_EXPLICIT);
+        param.setCompressionQuality(JPEG_QUALITY);
         ByteArrayOutputStream out = new ByteArrayOutputStream();
-        if (!ImageIO.write(img, "jpg", out)) throw new IOException("No JPEG encoder available");
+        try (var ios = ImageIO.createImageOutputStream(out)) {
+            writer.setOutput(ios);
+            writer.write(null, new javax.imageio.IIOImage(img, null, null), param);
+        } finally {
+            writer.dispose();
+        }
         return out.toByteArray();
     }
 }

@@ -38,8 +38,12 @@ import javax.swing.text.html.HTMLEditorKit;
 /** Always-on-top, translucent, borderless panel showing transcript, chat and the model's suggestion. */
 public final class OverlayWindow {
     private static final int PANE_BASE_HEIGHT = 0;
-    private static final int CHUNK_SECONDS = 6;
+    // Transcript weight when the suggestion is hidden (80% of the pane space) vs shown (40%).
+    private static final double TRANSCRIPT_WEIGHT_ALONE = 8, TRANSCRIPT_WEIGHT_SHARED = 4;
+    private static final int CHUNK_SECONDS = 3;
     private static final int MAX_LINES = 40;
+    private static final int MAX_SHOWN_LINES = 300; // the transcript box scrolls, so keep history to copy from
+    private static final int REPLY_LINES = 15; // quick replies only need the recent conversation
     private static final Color FG = new Color(0xE8E8EA);
     private static final Color BOX_BG = new Color(0, 0, 0, 64);
     private static final Color ON_GREEN = new Color(0x1F7A4D);
@@ -53,7 +57,7 @@ public final class OverlayWindow {
     private final JTextArea question = new JTextArea(3, 20);
     private final JLabel status = new JLabel();
 
-    private final List<String> transcript = new ArrayList<>();
+    private final Transcript transcript = new Transcript();
     private final List<String> chat = new ArrayList<>();
     // One worker keeps transcription in recording order; LLM calls get their own so they never wait behind STT.
     private final ExecutorService sttWorker = Executors.newSingleThreadExecutor(daemon("stt"));
@@ -61,9 +65,16 @@ public final class OverlayWindow {
 
     private final JButton snapBtn = new JButton("Snap");
     private volatile ScreenSnap.Snap snapshot;
+    private volatile boolean refreshPending;
+    private volatile String lastAnswer = "";
     private JScrollPane chatScroll;
+    private JScrollPane transcriptScroll;
+    private JScrollPane answerScroll;
+    private JButton answerToggle;
+    private JPanel columnPanel;
     private JButton chatToggle;
     private final JButton goBtn = new JButton("Suggest");
+    private final JButton answerGoBtn = small("Suggest"); // same action, next to the suggestion area
     private volatile int suggestId;
     private java.util.concurrent.Future<?> pending;
     private final JComboBox<DeviceItem> inputBox = new JComboBox<>();
@@ -123,15 +134,31 @@ public final class OverlayWindow {
     /** Sends the current context to the LLM and shows the suggestion. A request already in flight is cancelled. */
     public void suggest() {
         cancelSuggest();
-        Llm.Input in = new Llm.Input((String) mode.getSelectedItem(), tail(transcript), tail(chat), question.getText(),
-            snapshot == null ? null : snapshot.dataUrl());
+        String selectedMode = (String) mode.getSelectedItem();
+        int lines = "reply".equals(selectedMode) ? REPLY_LINES : MAX_LINES;
+        String selection = takeSelection();
+        Llm.Input in = new Llm.Input(selectedMode, tail(transcript.lines(), lines), tail(chat, lines), question.getText(),
+            snapshot == null ? null : snapshot.dataUrl(), selection);
         boolean sendingImage = snapshot != null;
-        setStatus("Thinking…");
+        setStatus(selection == null ? "Thinking…" : "Thinking about the selected text (" + selection.length() + " chars)…");
+        setSuggestionVisible(true); // expand the suggestion area (transcript shrinks to 40%)
         setSuggestRunning(true);
         final int id = ++suggestId;
         pending = llmWorker.submit(() -> {
             try {
-                String text = Llm.complete(in);
+                StringBuffer acc = new StringBuffer(); // appended on the worker thread, read on the EDT
+                java.util.concurrent.atomic.AtomicBoolean renderPending = new java.util.concurrent.atomic.AtomicBoolean();
+                String text = Llm.stream(in, piece -> {
+                    if (id != suggestId) return;
+                    acc.append(piece);
+                    // Repaint at most once per EDT turn so fast streams don't flood the UI.
+                    if (renderPending.compareAndSet(false, true)) {
+                        SwingUtilities.invokeLater(() -> {
+                            renderPending.set(false);
+                            if (id == suggestId) renderAnswer(acc.toString());
+                        });
+                    }
+                });
                 if (id != suggestId) return; // cancelled or superseded while the reply was arriving
                 SwingUtilities.invokeLater(() -> renderAnswer(text.isEmpty() ? "(empty response)" : text));
                 setStatus("Done.");
@@ -148,6 +175,11 @@ public final class OverlayWindow {
         });
     }
 
+    /** The Suggest buttons' action: cancels a running request, otherwise starts a new one. */
+    private void suggestOrCancel() {
+        if ("Cancel".equals(goBtn.getText())) cancelSuggest(); else suggest();
+    }
+
     /** Cancels the in-flight suggestion request, if any. The attached screenshot is kept for a retry. */
     public void cancelSuggest() {
         java.util.concurrent.Future<?> f = pending;
@@ -159,7 +191,10 @@ public final class OverlayWindow {
     }
 
     private void setSuggestRunning(boolean running) {
-        SwingUtilities.invokeLater(() -> goBtn.setText(running ? "Cancel" : "Suggest"));
+        SwingUtilities.invokeLater(() -> {
+            goBtn.setText(running ? "Cancel" : "Suggest");
+            answerGoBtn.setText(running ? "Cancel" : "Suggest");
+        });
     }
 
     /**
@@ -308,9 +343,11 @@ public final class OverlayWindow {
         sttWorker.submit(() -> {
             try {
                 String text = SttLocal.transcribe(samples);
+                // add() returns false for a mic line that merely echoes the other side; it may also remove
+                // an earlier echo, so refresh either way.
                 if (!text.isEmpty()) {
-                    String line = speaker == null ? text : speaker + ": " + text;
-                    SwingUtilities.invokeLater(() -> { transcript.add(line); refresh(); });
+                    transcript.add(speaker, text, System.currentTimeMillis());
+                    SwingUtilities.invokeLater(this::refresh);
                 }
             } catch (Exception e) {
                 if (!sttFailed) { sttFailed = true; setStatus("Voice-to-text failed: " + e.getMessage()); }
@@ -364,14 +401,72 @@ public final class OverlayWindow {
         });
     }
 
+    /**
+     * The overlay is non-focusable so clicking its buttons never activates this app (which could bring another
+     * app in front of Chrome). A text component is the exception: the window becomes focusable while the pointer
+     * is over it or it has focus, so clicking works normally for typing, selecting and copying.
+     */
+    private void focusOnHover(javax.swing.text.JTextComponent c) {
+        c.addFocusListener(new java.awt.event.FocusAdapter() {
+            @Override public void focusLost(java.awt.event.FocusEvent e) {
+                if (c.getMousePosition() == null) frame.setFocusableWindowState(false);
+            }
+        });
+        c.addMouseListener(new MouseAdapter() {
+            @Override public void mouseEntered(MouseEvent e) { frame.setFocusableWindowState(true); }
+            @Override public void mouseExited(MouseEvent e) { if (!c.hasFocus()) frame.setFocusableWindowState(false); }
+            @Override public void mousePressed(MouseEvent e) {
+                frame.setFocusableWindowState(true);
+                MacWindow.activateApp();
+                c.requestFocusInWindow();
+                // Activation is asynchronous; retry the focus request once the app is active.
+                new javax.swing.Timer(150, ev -> c.requestFocusInWindow()) {{ setRepeats(false); start(); }};
+            }
+        });
+    }
+
+    /**
+     * Returns the text the user highlighted in the transcript, chat or suggestion (null if none) and clears the
+     * highlight so live transcript updates resume. Reading it here, before the answer box is rewritten, matters.
+     */
+    private String takeSelection() {
+        StringBuilder out = new StringBuilder();
+        for (javax.swing.text.JTextComponent t : new javax.swing.text.JTextComponent[] {transcriptBox, chatBox, answer}) {
+            String sel = t.getSelectedText();
+            if (sel != null && !sel.isBlank()) {
+                if (!out.isEmpty()) out.append('\n');
+                out.append(sel.strip());
+                t.setCaretPosition(t.getSelectionEnd()); // clears the highlight
+            }
+        }
+        if (out.isEmpty()) return null;
+        return out.toString();
+    }
+
+    private boolean hasSelection() {
+        return transcriptBox.getSelectionStart() != transcriptBox.getSelectionEnd()
+            || chatBox.getSelectionStart() != chatBox.getSelectionEnd();
+    }
+
+    private void copyToClipboard(String text, String what) {
+        if (text == null || text.isBlank()) { setStatus("Nothing to copy."); return; }
+        Toolkit.getDefaultToolkit().getSystemClipboard()
+            .setContents(new java.awt.datatransfer.StringSelection(text), null);
+        setStatus(what + " copied.");
+    }
+
     private void refresh() {
-        transcriptBox.setText(String.join("\n", lastN(transcript, 8)));
+        // Rewriting the text would wipe what the user is selecting, so wait until the selection is gone.
+        if (hasSelection()) { refreshPending = true; return; }
+        refreshPending = false;
+        transcriptBox.setText(String.join("\n", lastN(transcript.lines(), MAX_SHOWN_LINES)));
         chatBox.setText(String.join("\n", lastN(chat, 6)));
         transcriptBox.setCaretPosition(transcriptBox.getDocument().getLength());
     }
 
     // Renders text with ``` fenced blocks as <pre>, everything else escaped.
     private void renderAnswer(String text) {
+        lastAnswer = text;
         String[] parts = text.split("```(?:\\w+)?\\n?", -1);
         StringBuilder html = new StringBuilder("<html><body style='color:#E8E8EA;font-family:sans-serif;font-size:12px'>");
         for (int i = 0; i < parts.length; i++) {
@@ -411,7 +506,7 @@ public final class OverlayWindow {
         title.setFont(title.getFont().deriveFont(Font.BOLD));
         JButton chatBtn = new JButton("Paste chat");
         chatBtn.addActionListener(e -> ingestChat());
-        goBtn.addActionListener(e -> { if ("Cancel".equals(goBtn.getText())) cancelSuggest(); else suggest(); });
+        goBtn.addActionListener(e -> suggestOrCancel());
         mic.addActionListener(e -> toggleMic());
         snapBtn.addActionListener(e -> snap());
         snapBtn.addMouseListener(new MouseAdapter() {
@@ -431,28 +526,15 @@ public final class OverlayWindow {
         answer.setEditorKit(new HTMLEditorKit());
         answer.setEditable(false);
         answer.setOpaque(false);
-        // Focusable only while the pointer is over the box (or while typing), so clicking the buttons never
-        // activates this app, but a click in the box is a normal click on a focusable window.
-        question.addFocusListener(new java.awt.event.FocusAdapter() {
-            @Override public void focusLost(java.awt.event.FocusEvent e) {
-                // Typing is over (e.g. a button was clicked or another app took focus): stop being focusable
-                // unless the pointer is still over the box.
-                if (question.getMousePosition() == null) frame.setFocusableWindowState(false);
-            }
-        });
-        question.addMouseListener(new MouseAdapter() {
-            @Override public void mouseEntered(MouseEvent e) { frame.setFocusableWindowState(true); }
-            @Override public void mouseExited(MouseEvent e) {
-                if (!question.hasFocus()) frame.setFocusableWindowState(false);
-            }
-            @Override public void mousePressed(MouseEvent e) {
-                frame.setFocusableWindowState(true);
-                MacWindow.activateApp();
-                question.requestFocusInWindow();
-                // Activation is asynchronous; retry the focus request once the app is active.
-                new javax.swing.Timer(150, ev -> question.requestFocusInWindow()) {{ setRepeats(false); start(); }};
-            }
-        });
+        // Text areas the user can click into (type, select, copy) need keyboard focus; see focusOnHover.
+        focusOnHover(question);
+        focusOnHover(transcriptBox);
+        focusOnHover(chatBox);
+        focusOnHover(answer);
+        for (javax.swing.text.JTextComponent t : new javax.swing.text.JTextComponent[] {transcriptBox, chatBox}) {
+            // Live updates pause while text is selected; apply the pending update once the selection is gone.
+            t.addCaretListener(e -> { if (refreshPending && !hasSelection()) refresh(); });
+        }
         question.setLineWrap(true);
         question.setWrapStyleWord(true);
         question.setForeground(Color.BLACK);
@@ -483,18 +565,42 @@ public final class OverlayWindow {
         JPanel tHead = new JPanel(new BorderLayout(6, 0));
         tHead.setOpaque(false);
         tHead.add(label("Live transcript"), BorderLayout.WEST);
-        tHead.add(inputBox, BorderLayout.EAST);
+        JButton copyTranscript = small("Copy");
+        copyTranscript.addActionListener(e -> copyToClipboard(String.join("\n", transcript.lines()), "Transcript"));
+        JPanel tRight = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.RIGHT, 4, 0));
+        tRight.setOpaque(false);
+        tRight.add(copyTranscript);
+        tRight.add(inputBox);
+        tHead.add(tRight, BorderLayout.EAST);
         add(panel, tHead, 0, 1, 0);
         // Heights share the spare space by weight: transcript 40%, suggestion 40%, chat 10%, input 10%.
         // Preferred heights are equal and small so only the weights decide the split.
         JScrollPane questionScroll = scroll(question, PANE_BASE_HEIGHT);
         questionScroll.setBorder(BorderFactory.createEmptyBorder());
-        add(panel, scroll(transcriptBox, PANE_BASE_HEIGHT), 0, 2, 4);
+        columnPanel = panel;
+        transcriptScroll = scroll(transcriptBox, PANE_BASE_HEIGHT);
+        add(panel, transcriptScroll, 0, 2, TRANSCRIPT_WEIGHT_ALONE);
         chatScroll = scroll(chatBox, PANE_BASE_HEIGHT);
         add(panel, chatHeader(), 0, 3, 0);
         add(panel, chatScroll, 0, 4, 1);
-        add(panel, label("Suggestion"), 0, 5, 0);
-        add(panel, scroll(answer, PANE_BASE_HEIGHT), 0, 6, 4);
+        answerScroll = scroll(answer, PANE_BASE_HEIGHT);
+        answerToggle = small("Show");
+        answerToggle.addActionListener(e -> setSuggestionVisible(!answerScroll.isVisible()));
+        JPanel answerHead = new JPanel(new BorderLayout());
+        answerHead.setOpaque(false);
+        answerHead.add(label("Suggestion"), BorderLayout.WEST);
+        JButton copyAnswer = small("Copy");
+        copyAnswer.addActionListener(e -> copyToClipboard(lastAnswer, "Suggestion"));
+        JPanel aRight = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.RIGHT, 4, 0));
+        aRight.setOpaque(false);
+        answerGoBtn.addActionListener(e -> suggestOrCancel());
+        aRight.add(answerGoBtn);
+        aRight.add(copyAnswer);
+        aRight.add(answerToggle);
+        answerHead.add(aRight, BorderLayout.EAST);
+        add(panel, answerHead, 0, 5, 0);
+        add(panel, answerScroll, 0, 6, 4);
+        answerScroll.setVisible(false); // collapsed until the first Suggest; the transcript gets the room
         add(panel, questionScroll, 0, 7, 1);
         add(panel, status, 0, 8, 0);
         return panel;
@@ -532,6 +638,16 @@ public final class OverlayWindow {
     }
 
     /** Collapses or expands the meeting chat box (the chat is still sent to the model while hidden). */
+    /** Shows or hides the suggestion area; hidden, the live transcript takes 80% of the pane space, shown 40/40. */
+    public void setSuggestionVisible(boolean show) {
+        answerScroll.setVisible(show);
+        answerToggle.setText(show ? "Hide" : "Show");
+        ((WeightedColumn) columnPanel.getLayout()).weights.put(transcriptScroll,
+            show ? TRANSCRIPT_WEIGHT_SHARED : TRANSCRIPT_WEIGHT_ALONE);
+        columnPanel.revalidate();
+        columnPanel.repaint();
+    }
+
     public void toggleChatVisible() {
         boolean show = !chatScroll.isVisible();
         chatScroll.setVisible(show);
@@ -677,7 +793,7 @@ public final class OverlayWindow {
         };
     }
 
-    private static String tail(List<String> lines) { return String.join("\n", lastN(lines, MAX_LINES)); }
+    private static String tail(List<String> lines, int n) { return String.join("\n", lastN(lines, n)); }
 
     private static List<String> lastN(List<String> l, int n) { return l.subList(Math.max(0, l.size() - n), l.size()); }
 
