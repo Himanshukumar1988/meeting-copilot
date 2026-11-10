@@ -24,10 +24,16 @@ public final class Llm {
      * @param selection text the user highlighted in the transcript/chat/suggestion; when present it is the
      *                  main subject and the transcript and chat are only background
      */
-    public record Input(String mode, String transcript, String chat, String question, String imageDataUrl, String selection) {
+    public record Input(String mode, String transcript, String chat, String question, String imageDataUrl, String selection,
+                        String screenText) {
+        /** Convenience for callers without a screenshot text. */
+        public Input(String mode, String transcript, String chat, String question, String imageDataUrl, String selection) {
+            this(mode, transcript, chat, question, imageDataUrl, selection, null);
+        }
+
         /** Convenience for callers without a selection. */
         public Input(String mode, String transcript, String chat, String question, String imageDataUrl) {
-            this(mode, transcript, chat, question, imageDataUrl, null);
+            this(mode, transcript, chat, question, imageDataUrl, null, null);
         }
     }
 
@@ -55,9 +61,12 @@ public final class Llm {
         String background = hasSelection ? " (background only)" : "";
         append(user, "# Meeting chat" + background, in.chat());
         append(user, "# Live transcript (most recent last)" + background, in.transcript());
+        boolean hasScreenText = in.screenText() != null && !in.screenText().isBlank();
+        if (hasScreenText) append(user, "# Text read from the user's screenshot (OCR, may contain small errors)", in.screenText());
         append(user, "# User request", in.question());
         boolean hasImage = in.imageDataUrl() != null;
-        if (user.isEmpty() && hasImage) user.append("# User request\nSolve or answer what the attached screenshot shows.");
+        if (user.isEmpty() && hasScreenText) user.append("# User request\nSolve or answer what the screenshot text shows.");
+        else if (user.isEmpty() && hasImage) user.append("# User request\nSolve or answer what the attached screenshot shows.");
         else if (user.isEmpty()) user.append("# User request\nNo context yet. Say what you need.");
 
         JsonArray messages = new JsonArray();
@@ -167,6 +176,21 @@ public final class Llm {
         body.add("messages", messages);
         body.addProperty("max_tokens", 4096);
         return body;
+    }
+
+    /**
+     * Translates one transcript line to English with the text model. Meant for speech-to-text output, so it
+     * copes with code-mixed speech (Hinglish) and recognition errors, and returns English input unchanged.
+     */
+    public static String translateToEnglish(String text) throws IOException, InterruptedException {
+        JsonArray messages = new JsonArray();
+        messages.add(message("system", "You translate speech-to-text transcript lines into natural English. "
+            + "The input may be Hindi (Devanagari or romanised), Hinglish (Hindi mixed with English), or any other language, "
+            + "and may contain recognition errors: infer the intended meaning. Keep names, product names and technical terms "
+            + "(e.g. QA, API, release) as they are. If the line is already English, return it unchanged. "
+            + "Output ONLY the English text, with no quotes or explanations."));
+        messages.add(message("user", text));
+        return chat(Config.load(), messages).strip();
     }
 
     /** Low-level call shared with the standalone sample. */

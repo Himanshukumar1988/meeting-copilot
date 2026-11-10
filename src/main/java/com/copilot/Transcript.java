@@ -28,13 +28,24 @@ public final class Transcript {
     public synchronized boolean add(String speaker, String text, long nowMs) {
         if ("Me".equals(speaker) && isEchoOfThem(text, nowMs, null)) return false;
         entries.add(new Entry(speaker, text, nowMs));
-        if ("Them".equals(speaker)) {
+        if (isThem(speaker)) {
             // The system audio can arrive after its mic echo: remove any recent "Me" lines it explains.
             entries.removeIf(e -> "Me".equals(e.speaker()) && nowMs - e.timeMs() <= ECHO_WINDOW_MS
                 && isEchoOfThem(e.text(), nowMs, e));
         }
         return true;
     }
+
+    // "Them" or a numbered voice such as "Them 2": everything that came from the system audio.
+    private static boolean isThem(String speaker) { return speaker != null && speaker.startsWith("Them"); }
+
+    /** Renames a speaker on every existing line (e.g. "Them" becomes "Them 1" once a second voice is heard). */
+    public synchronized void relabel(String from, String to) {
+        entries.replaceAll(e -> from.equals(e.speaker()) ? new Entry(to, e.text(), e.timeMs()) : e);
+    }
+
+    /** Removes every line (and with it the echo-matching history). */
+    public synchronized void clear() { entries.clear(); }
 
     public synchronized List<String> lines() {
         List<String> out = new ArrayList<>(entries.size());
@@ -49,7 +60,7 @@ public final class Transcript {
         if (me.size() < MIN_WORDS) return false;
         Set<String> them = new HashSet<>();
         for (Entry e : entries) {
-            if (e != ignored && "Them".equals(e.speaker()) && nowMs - e.timeMs() <= ECHO_WINDOW_MS) them.addAll(words(e.text()));
+            if (e != ignored && isThem(e.speaker()) && nowMs - e.timeMs() <= ECHO_WINDOW_MS) them.addAll(words(e.text()));
         }
         if (them.isEmpty()) return false;
         long shared = me.stream().filter(them::contains).count();

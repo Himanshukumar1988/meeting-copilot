@@ -13,7 +13,7 @@ public final class Config {
     public record Settings(String apiKey, String baseUrl, String model) {}
 
     private static final Pattern LINE = Pattern.compile("^\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*(.*?)\\s*$");
-    private static final Map<String, String> DOTENV = loadEnv(Path.of(".env"));
+    private static final Map<String, String> DOTENV = loadEnv(AppDirs.path(".env"));
 
     private Config() {}
 
@@ -40,10 +40,35 @@ public final class Config {
         return (v == null || v.isBlank()) ? fallback : v;
     }
 
+    private static final String ENV_TEMPLATE = String.join("\n",
+        "# Meeting Copilot settings. Set LLM_API_KEY, then restart the app.",
+        "LLM_API_KEY=",
+        "LLM_BASE_URL=https://api.inference.paytm.com/v1",
+        "LLM_MODEL=al-agentic-gpt-oss-120b",
+        "# Used only when a screenshot has too little text to read and the image itself is sent.",
+        "LLM_VISION_MODEL=al-gpt-5",
+        "", "");
+
+    /**
+     * Creates a settings template at the app's data folder if there is none yet (first run of an installed app).
+     * @return true if it was just created, so the caller can tell the user where to put their API key
+     */
+    public static boolean ensureEnvFile() {
+        Path file = AppDirs.path(".env");
+        if (Files.exists(file)) return false;
+        try {
+            Files.createDirectories(file.getParent());
+            Files.writeString(file, ENV_TEMPLATE);
+            return true;
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
     /** Returns validated LLM settings; fails loudly when the API key is missing. */
     public static Settings load() {
         String apiKey = get("LLM_API_KEY", null);
-        if (apiKey == null) throw new IllegalStateException("LLM_API_KEY is not set (copy .env.example to .env)");
+        if (apiKey == null) throw new IllegalStateException("LLM_API_KEY is not set. Add it to " + AppDirs.path(".env") + " and restart the app.");
         String baseUrl = get("LLM_BASE_URL", "https://api.inference.paytm.com/v1").replaceAll("/$", "");
         return new Settings(apiKey, baseUrl, get("LLM_MODEL", "al-agentic-gpt-oss-120b"));
     }

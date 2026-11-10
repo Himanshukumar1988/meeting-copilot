@@ -19,6 +19,7 @@ import java.awt.event.MouseEvent;
 import java.awt.event.MouseMotionAdapter;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import javax.swing.BorderFactory;
@@ -61,11 +62,33 @@ public final class OverlayWindow {
     private final List<String> chat = new ArrayList<>();
     // One worker keeps transcription in recording order; LLM calls get their own so they never wait behind STT.
     private final ExecutorService sttWorker = Executors.newSingleThreadExecutor(daemon("stt"));
+    private final EchoGate echoGate = new EchoGate();
+    private static final long ECHO_WAIT_MS = 1500;
+    private final java.util.concurrent.ScheduledExecutorService echoDelay =
+        java.util.concurrent.Executors.newSingleThreadScheduledExecutor(daemon("echo-wait"));
+    private final ExecutorService translateWorkers = Executors.newFixedThreadPool(3, daemon("translate"));
+    private final java.util.concurrent.atomic.AtomicInteger queuedChunks = new java.util.concurrent.atomic.AtomicInteger();
+    private static final int MAX_QUEUED_CHUNKS = 4;          // ~12 s of audio waiting for the local speech model
+    private static final boolean TRANSLATE_MIC = "on".equalsIgnoreCase(Config.get("TRANSLATE_MIC", "off"));
+    private volatile long lastBehindNoticeMs;
+    private final Object deliveryLock = new Object();
+    private CompletableFuture<Void> deliveryTail = CompletableFuture.completedFuture(null);
     private final ExecutorService llmWorker = Executors.newSingleThreadExecutor(daemon("llm"));
 
     private final JButton snapBtn = new JButton("Snap");
     private volatile ScreenSnap.Snap snapshot;
+    private volatile String snapshotText; // OCR of the snapshot; when long enough it replaces sending the image
     private volatile boolean refreshPending;
+    private volatile boolean translateToEnglish;
+    private volatile boolean autoSuggest;
+    private final SpeakerId speakerId = new SpeakerId();
+    private final boolean speakersEnabled = !"off".equalsIgnoreCase(Config.get("SPEAKERS", "on"));
+    private int lastThemVoice = -1; // touched only by the STT worker thread
+    private volatile boolean speakerModelFailed;
+    private volatile long lastAutoSuggestMs;
+    private static final long AUTO_COOLDOWN_MS = 12_000;
+    private final JButton autoBtn = small("Auto");
+    private final JButton translateBtn = small("→EN");
     private volatile String lastAnswer = "";
     private JScrollPane chatScroll;
     private JScrollPane transcriptScroll;
@@ -120,7 +143,7 @@ public final class OverlayWindow {
     // Appends every status message to .logs/copilot.log so errors can be read even when the overlay is hidden from capture.
     private static synchronized void log(String msg) {
         try {
-            java.nio.file.Path f = java.nio.file.Path.of(".logs", "copilot.log");
+            java.nio.file.Path f = AppDirs.path(".logs", "copilot.log");
             java.nio.file.Files.createDirectories(f.getParent());
             java.nio.file.Files.writeString(f, java.time.LocalTime.now().withNano(0) + "  " + msg + "\n",
                 java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
@@ -132,15 +155,27 @@ public final class OverlayWindow {
     // ---- actions --------------------------------------------------------------------------
 
     /** Sends the current context to the LLM and shows the suggestion. A request already in flight is cancelled. */
-    public void suggest() {
+    public void suggest() { suggest(null); }
+
+    /**
+     * @param autoQuestion non-null for an automatic suggestion: a reply to this question from the other side,
+     *                     ignoring the typed question, highlighted text and screenshot (those stay for a manual press)
+     */
+    private void suggest(String autoQuestion) {
+        boolean auto = autoQuestion != null;
         cancelSuggest();
         String selectedMode = (String) mode.getSelectedItem();
         int lines = "reply".equals(selectedMode) ? REPLY_LINES : MAX_LINES;
-        String selection = takeSelection();
-        Llm.Input in = new Llm.Input(selectedMode, tail(transcript.lines(), lines), tail(chat, lines), question.getText(),
-            snapshot == null ? null : snapshot.dataUrl(), selection);
-        boolean sendingImage = snapshot != null;
-        setStatus(selection == null ? "Thinking…" : "Thinking about the selected text (" + selection.length() + " chars)…");
+        String selection = auto ? null : takeSelection();
+        // Enough text on the screenshot: send just the text to the fast model; otherwise send the image.
+        boolean useOcr = !auto && snapshotText != null && snapshotText.length() >= Ocr.MIN_USEFUL_CHARS;
+        String asked = auto ? "Reply to the latest question or request from the other side: " + autoQuestion : question.getText();
+        boolean withImage = !auto && snapshot != null;
+        Llm.Input in = new Llm.Input(selectedMode, tail(transcript.lines(), lines), tail(chat, lines), asked,
+            useOcr || !withImage ? null : snapshot.dataUrl(), selection, useOcr ? snapshotText : null);
+        boolean sendingImage = withImage; // also true for the OCR path: the screenshot is used up either way
+        setStatus(auto ? "Auto-suggestion for: " + autoQuestion
+            : selection == null ? "Thinking…" : "Thinking about the selected text (" + selection.length() + " chars)…");
         setSuggestionVisible(true); // expand the suggestion area (transcript shrinks to 40%)
         setSuggestRunning(true);
         final int id = ++suggestId;
@@ -178,6 +213,87 @@ public final class OverlayWindow {
     /** The Suggest buttons' action: cancels a running request, otherwise starts a new one. */
     private void suggestOrCancel() {
         if ("Cancel".equals(goBtn.getText())) cancelSuggest(); else suggest();
+    }
+
+    /**
+     * Turns detect-language-and-translate-to-English on or off for speech-to-text. The first time, the larger
+     * multilingual model is downloaded, which takes a while, so that happens off the UI thread with progress shown.
+     */
+    public void toggleTranslate() {
+        if (translateToEnglish) {
+            translateToEnglish = false;
+            setTranslateButton(false);
+            setStatus("Translation off: English-only transcription.");
+            return;
+        }
+        setStatus(SttLocal.multilingualReady() ? "Loading the multilingual model…"
+            : "Downloading the multilingual model " + SttLocal.multilingualModelName() + " (one time, up to 470 MB)…");
+        translateBtn.setEnabled(false);
+        new Thread(() -> {
+            try {
+                SttLocal.preloadMultilingual();
+                translateToEnglish = true;
+                setTranslateButton(true);
+                setStatus(SttLocal.isIntel()
+                    ? "Translation on (Intel Mac: lighter model " + SttLocal.multilingualModelName() + ", so expect lower accuracy and some lag)."
+                    : "Translation on: any language is detected and shown in English.");
+            } catch (Exception e) {
+                setStatus("Could not enable translation: " + e.getMessage());
+            } finally {
+                SwingUtilities.invokeLater(() -> translateBtn.setEnabled(true));
+            }
+        }, "stt-multilingual-load").start();
+    }
+
+    // "Them" when one voice has been heard on the system audio, "Them 1/2/…" once several have. Runs on the
+    // STT worker thread. If the speaker model is unavailable the lines simply stay "Them".
+    private String themLabel(float[] samples) {
+        if (!speakersEnabled || speakerModelFailed) return "Them";
+        try {
+            if (!SpeakerId.modelReady()) setStatus("Downloading the speaker model (one time, about 26 MB)…");
+            int before = speakerId.speakers();
+            int voice = speakerId.identify(samples);
+            if (voice < 0) voice = lastThemVoice; // too short/quiet to tell: assume the previous speaker
+            else lastThemVoice = voice;
+            if (speakerId.speakers() >= 2 && before < 2) transcript.relabel("Them", "Them 1"); // the earlier lines were voice 1
+            return speakerId.speakers() >= 2 && voice >= 0 ? "Them " + (voice + 1) : "Them";
+        } catch (Exception e) {
+            speakerModelFailed = true;
+            setStatus("Speaker labels unavailable (" + e.getMessage() + "); using \"Them\" for everyone else.");
+            return "Them";
+        }
+    }
+
+    // When the other side asks a question or makes a request, suggest a reply without being asked.
+    // Skipped while a request is running, within the cooldown, or while the user is typing a question of their own.
+    private void maybeAutoSuggest(String text) {
+        if (!autoSuggest) return;
+        String q = Questions.find(text);
+        long now = System.currentTimeMillis();
+        if (q == null || now - lastAutoSuggestMs < AUTO_COOLDOWN_MS) return;
+        SwingUtilities.invokeLater(() -> {
+            if (!"Suggest".equals(goBtn.getText()) || question.hasFocus()) return; // busy, or the user is typing
+            lastAutoSuggestMs = now;
+            suggest(q);
+        });
+    }
+
+    /** Turns automatic suggestions for questions from the other side on or off. */
+    public void toggleAuto() {
+        autoSuggest = !autoSuggest;
+        autoBtn.setBackground(autoSuggest ? ON_GREEN : null);
+        autoBtn.setOpaque(autoSuggest);
+        autoBtn.setForeground(autoSuggest ? Color.WHITE : null);
+        setStatus(autoSuggest ? "Auto-suggest on: a reply is drafted when the other side asks a question or makes a request."
+            : "Auto-suggest off.");
+    }
+
+    private void setTranslateButton(boolean on) {
+        SwingUtilities.invokeLater(() -> {
+            translateBtn.setBackground(on ? ON_GREEN : null);
+            translateBtn.setOpaque(on);
+            translateBtn.setForeground(on ? Color.WHITE : null);
+        });
     }
 
     /** Cancels the in-flight suggestion request, if any. The attached screenshot is kept for a retry. */
@@ -256,10 +372,28 @@ public final class OverlayWindow {
     private void attach(java.awt.image.BufferedImage shot, java.awt.Rectangle region) {
         try {
             java.awt.Rectangle r = region.intersection(new java.awt.Rectangle(0, 0, shot.getWidth(), shot.getHeight()));
-            ScreenSnap.Snap s = ScreenSnap.encode(shot.getSubimage(r.x, r.y, r.width, r.height));
+            java.awt.image.BufferedImage crop = shot.getSubimage(r.x, r.y, r.width, r.height);
+            ScreenSnap.Snap s = ScreenSnap.encode(crop);
             snapshot = s;
+            snapshotText = null;
             SwingUtilities.invokeLater(() -> snapBtn.setText("Snap ✓"));
-            setStatus("Screenshot attached (" + s.width() + "x" + s.height() + "). Sent with the next Suggest; right-click Snap to drop it.");
+            setStatus("Screenshot attached (" + s.width() + "x" + s.height() + "). Reading its text…");
+            if (!Ocr.enabled()) {
+                setStatus("Screenshot attached (" + s.width() + "x" + s.height() + "). Sent with the next Suggest; right-click Snap to drop it.");
+                return;
+            }
+            // Reading the text now means it is ready (and fast to use) by the time Suggest is pressed.
+            try {
+                long t0 = System.nanoTime();
+                String text = Ocr.read(crop);
+                snapshotText = text;
+                setStatus(text.length() >= Ocr.MIN_USEFUL_CHARS
+                    ? "Screenshot attached: " + text.length() + " characters of text read in "
+                        + Math.round((System.nanoTime() - t0) / 1e8) / 10.0 + "s (fast mode). Right-click Snap to drop it."
+                    : "Screenshot attached (little text found, so the image itself will be sent). Right-click Snap to drop it.");
+            } catch (Exception e) {
+                setStatus("Screenshot attached (text reading unavailable: " + e.getMessage() + "); the image will be sent.");
+            }
         } catch (Exception e) {
             setStatus("Screenshot failed: " + e.getMessage());
         }
@@ -267,6 +401,7 @@ public final class OverlayWindow {
 
     private void clearSnap() {
         snapshot = null;
+        snapshotText = null;
         SwingUtilities.invokeLater(() -> snapBtn.setText("Snap"));
     }
 
@@ -295,6 +430,7 @@ public final class OverlayWindow {
         DeviceItem choice = (DeviceItem) inputBox.getSelectedItem();
         Source source = choice == null ? Source.MIC : choice.source();
         setStatus("Starting audio…");
+        prefetchModels(); // downloads (if needed) happen now, not in the middle of the first chunks
         // Starting the system-audio helper can compile it and wait for it, so keep that off the UI thread.
         new Thread(() -> {
             try {
@@ -340,19 +476,95 @@ public final class OverlayWindow {
     // speaker is a transcript label ('Me'/'Them'), or null when there is a single unlabelled source.
     private void onAudioChunk(float[] samples, String speaker) {
         if (rms(samples) < 0.003) return; // near-silence: skip so Whisper doesn't hallucinate text
+        final long heardAt = System.currentTimeMillis(); // the chunk has just ended: this is when its speech finished
+        if ("Them".equals(speaker)) echoGate.observeSystem(samples, heardAt);
+        if ("Me".equals(speaker) && recorders.stream().anyMatch(r -> r instanceof SystemAudioRecorder)) {
+            // The system-audio chunk covering the same moment arrives up to ~1 s after this mic chunk, so wait for it
+            // before deciding whether the mic is only re-hearing the speakers.
+            echoDelay.schedule(() -> handleChunk(samples, speaker, heardAt), ECHO_WAIT_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
+            return;
+        }
+        handleChunk(samples, speaker, heardAt);
+    }
+
+    private void handleChunk(float[] samples, String speaker, long heardAt) {
+        if ("Me".equals(speaker) && echoGate.isEcho(samples, heardAt)) {
+            log("TIMING Me skipped: the mic is re-hearing the system audio (speakers instead of headphones)");
+            return;
+        }
+        // If transcription can't keep up, skip the chunk rather than let the delay grow without limit.
+        if (queuedChunks.incrementAndGet() > MAX_QUEUED_CHUNKS) {
+            queuedChunks.decrementAndGet();
+            if (System.currentTimeMillis() - lastBehindNoticeMs > 10_000) {
+                lastBehindNoticeMs = System.currentTimeMillis();
+                setStatus("Transcription is behind, so some audio was skipped. Turn off →EN or pick the base model to speed up.");
+                log("TIMING skipped a chunk: " + MAX_QUEUED_CHUNKS + " chunks were already waiting");
+            }
+            return;
+        }
         sttWorker.submit(() -> {
             try {
-                String text = SttLocal.transcribe(samples);
-                // add() returns false for a mic line that merely echoes the other side; it may also remove
-                // an earlier echo, so refresh either way.
-                if (!text.isEmpty()) {
-                    transcript.add(speaker, text, System.currentTimeMillis());
-                    SwingUtilities.invokeLater(this::refresh);
-                }
-            } catch (Exception e) {
-                if (!sttFailed) { sttFailed = true; setStatus("Voice-to-text failed: " + e.getMessage()); }
+                String label = "Them".equals(speaker) ? themLabel(samples) : speaker;
+                // Translate mode hears the speech in its own language; the slow LLM step then runs in parallel
+                // (translateAsync) so it never holds up the next chunk. Your own mic stays on the fast English
+                // model unless TRANSLATE_MIC=on, since translation is meant for the other side.
+                boolean translate = translateToEnglish && (speaker == null || !"Me".equals(label) || TRANSLATE_MIC);
+                String heard = translate ? SttLocal.transcribeNative(samples) : SttLocal.transcribe(samples);
+                queuedChunks.decrementAndGet(); // the heavy local step is done; the queue length only counts that step
+                if (heard.isEmpty()) return;
+                long sttDoneAt = System.currentTimeMillis();
+                Timing timing = new Timing(heardAt, sttDoneAt, heard, translate);
+                if (translate && !Translator.looksEnglish(heard)) translateAsync(label, heard, timing);
+                else deliverInOrder(label, CompletableFuture.completedFuture(heard), timing);
+            } catch (Throwable e) { // Throwable: an Error thrown inside an executor task would otherwise vanish silently
+                queuedChunks.decrementAndGet();
+                if (!sttFailed) { sttFailed = true; setStatus("Voice-to-text failed: " + e); }
             }
         });
+    }
+
+    // Loads the speech models in the background when the mic starts, so a first-time download (148 MB English model,
+    // 26 MB speaker model, 470 MB multilingual model) overlaps with startup instead of stalling live transcription.
+    private void prefetchModels() {
+        new Thread(() -> {
+            try {
+                if (!SttLocal.englishReady()) setStatus("Downloading the speech model (one time, about 150 MB)…");
+                SttLocal.preloadEnglish();
+                if (speakersEnabled && !SpeakerId.modelReady()) setStatus("Downloading the speaker model (one time, about 26 MB)…");
+                if (speakersEnabled) speakerId.load();
+            } catch (Exception e) {
+                setStatus("Could not prepare the speech models: " + e.getMessage());
+            }
+        }, "model-prefetch").start();
+    }
+
+    // Translates on a separate pool, but lines are still added to the transcript in the order they were heard.
+    private void translateAsync(String label, String heard, Timing timing) {
+        deliverInOrder(label, CompletableFuture.supplyAsync(() -> Translator.toEnglish(heard), translateWorkers), timing);
+    }
+
+    /** When a chunk's speech ended, when Whisper finished it, and what it heard: for the latency log. */
+    private record Timing(long heardAt, long sttDoneAt, String heard, boolean translating) {}
+
+    private void deliverInOrder(String label, CompletableFuture<String> text, Timing timing) {
+        synchronized (deliveryLock) {
+            deliveryTail = deliveryTail.<String, Void>thenCombine(text, (done, t) -> {
+                // add() returns false for a mic line that merely echoes the other side; it may also remove an
+                // earlier echo, so refresh either way.
+                long now = System.currentTimeMillis();
+                boolean kept = transcript.add(label, t, now);
+                // Latency log (in the log file only): speech-end → line on screen, split into Whisper and translation.
+                log(String.format("TIMING %s total=%.1fs (whisper=%.1fs, translate+wait=%.1fs)%s | heard: %s | shown: %s",
+                    label, (now - timing.heardAt()) / 1000.0, (timing.sttDoneAt() - timing.heardAt()) / 1000.0,
+                    (now - timing.sttDoneAt()) / 1000.0, kept ? "" : " [dropped as echo]", clip(timing.heard()), clip(t)));
+                SwingUtilities.invokeLater(this::refresh);
+                if (kept && !"Me".equals(label)) maybeAutoSuggest(t);
+                return null;
+            }).exceptionally(ex -> { // one failed line must not block the ones after it
+                setStatus("Could not add a transcript line: " + ex);
+                return null;
+            });
+        }
     }
 
     // ---- UI helpers -----------------------------------------------------------------------
@@ -364,33 +576,60 @@ public final class OverlayWindow {
         DeviceItem(javax.sound.sampled.Mixer.Info info) { this(info, Source.MIC); }
 
         @Override public String toString() {
+            String mic = info == null ? "default mic" : info.getName();
             return switch (source) {
                 case SYSTEM -> "System audio (other side)";
-                case BOTH -> "Mic + system audio";
+                case BOTH -> "Mic + system audio (" + mic + ")";
                 case MIC -> info == null ? "Default mic" : info.getName();
             };
         }
+
+        // Mixer.Info objects are not reused between listings, so compare by name to keep the selection on refresh.
+        @Override public boolean equals(Object o) {
+            return o instanceof DeviceItem d && d.source == source && java.util.Objects.equals(name(d.info), name(info));
+        }
+
+        @Override public int hashCode() { return java.util.Objects.hash(source, name(info)); }
+
+        private static String name(javax.sound.sampled.Mixer.Info i) { return i == null ? null : i.getName(); }
     }
 
     private javax.sound.sampled.Mixer.Info selectedDevice() {
         DeviceItem d = (DeviceItem) inputBox.getSelectedItem();
-        return d == null ? null : d.info(); // null for the default mic and for system-only
+        return d == null ? null : d.info(); // null = the system default mic (or no mic at all for system-only)
+    }
+
+    private static boolean isBuiltIn(javax.sound.sampled.Mixer.Info mi) {
+        String n = mi.getName();
+        return n.contains("MacBook") || n.contains("Built-in") || n.contains("Internal");
     }
 
     // Lists the available inputs, keeping the current choice; re-run when the popup opens to pick up new devices.
+    // "Mic + system audio" is offered per microphone, so a Bluetooth headset can stay on high-quality output
+    // while the built-in mic is used for your voice.
     private void refreshInputs() {
         DeviceItem current = (DeviceItem) inputBox.getSelectedItem();
+        java.util.List<javax.sound.sampled.Mixer.Info> mics = new ArrayList<>();
+        for (javax.sound.sampled.Mixer.Info mi : MicRecorder.inputDevices()) {
+            if (!mi.getName().equals("Default Audio Device")) mics.add(mi);
+        }
         inputBox.removeAllItems();
         inputBox.addItem(new DeviceItem(null));
+        DeviceItem preferred = null;
         if (MacWindow.isMac()) {
             inputBox.addItem(new DeviceItem(null, Source.SYSTEM));
-            inputBox.addItem(new DeviceItem(null, Source.BOTH));
+            DeviceItem bothDefault = new DeviceItem(null, Source.BOTH);
+            inputBox.addItem(bothDefault);
+            preferred = bothDefault;
+            for (javax.sound.sampled.Mixer.Info mi : mics) {
+                DeviceItem both = new DeviceItem(mi, Source.BOTH);
+                inputBox.addItem(both);
+                if (isBuiltIn(mi) && preferred == bothDefault) preferred = both; // avoid Bluetooth call mode by default
+            }
         }
-        for (javax.sound.sampled.Mixer.Info mi : MicRecorder.inputDevices()) {
-            if (!mi.getName().equals("Default Audio Device")) inputBox.addItem(new DeviceItem(mi));
-        }
+        for (javax.sound.sampled.Mixer.Info mi : mics) inputBox.addItem(new DeviceItem(mi));
         if (current != null) inputBox.setSelectedItem(current);
-        else if (MacWindow.isMac()) inputBox.setSelectedIndex(2); // Mic + system audio: hears the caller even with headphones
+        else if (preferred != null) inputBox.setSelectedItem(preferred);
     }
 
     private void setMicButton(boolean on) {
@@ -569,10 +808,16 @@ public final class OverlayWindow {
         copyTranscript.addActionListener(e -> copyToClipboard(String.join("\n", transcript.lines()), "Transcript"));
         JPanel tRight = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.RIGHT, 4, 0));
         tRight.setOpaque(false);
+        translateBtn.setToolTipText("Detect the spoken language and show the transcript in English (multilingual model)");
+        translateBtn.addActionListener(e -> toggleTranslate());
+        JButton clearTranscript = small("Clear");
+        clearTranscript.addActionListener(e -> clearTranscript());
+        tRight.add(translateBtn);
         tRight.add(copyTranscript);
-        tRight.add(inputBox);
+        tRight.add(clearTranscript);
         tHead.add(tRight, BorderLayout.EAST);
         add(panel, tHead, 0, 1, 0);
+        add(panel, inputBox, 0, 1, 0); // audio source on its own row: the header has no room for its long names
         // Heights share the spare space by weight: transcript 40%, suggestion 40%, chat 10%, input 10%.
         // Preferred heights are equal and small so only the weights decide the split.
         JScrollPane questionScroll = scroll(question, PANE_BASE_HEIGHT);
@@ -594,6 +839,9 @@ public final class OverlayWindow {
         JPanel aRight = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.RIGHT, 4, 0));
         aRight.setOpaque(false);
         answerGoBtn.addActionListener(e -> suggestOrCancel());
+        autoBtn.setToolTipText("Automatically draft a reply when the other side asks a question");
+        autoBtn.addActionListener(e -> toggleAuto());
+        aRight.add(autoBtn);
         aRight.add(answerGoBtn);
         aRight.add(copyAnswer);
         aRight.add(answerToggle);
@@ -628,6 +876,16 @@ public final class OverlayWindow {
         b.setFont(b.getFont().deriveFont(10f));
         b.setMargin(new Insets(0, 4, 0, 4));
         return b;
+    }
+
+    /** Removes the whole live transcript, so it is no longer sent to the model either. */
+    public void clearTranscript() {
+        transcript.clear();
+        speakerId.reset();
+        lastThemVoice = -1;
+        refreshPending = false;
+        transcriptBox.setText("");
+        setStatus("Transcript cleared.");
     }
 
     /** Removes all pasted meeting chat from the context. */
@@ -792,6 +1050,8 @@ public final class OverlayWindow {
             default -> java.awt.Cursor.getDefaultCursor();
         };
     }
+
+    private static String clip(String s) { return s.length() <= 70 ? s : s.substring(0, 67) + "…"; }
 
     private static String tail(List<String> lines, int n) { return String.join("\n", lastN(lines, n)); }
 

@@ -14,6 +14,9 @@ public final class Main {
         SwingUtilities.invokeLater(() -> {
             OverlayWindow overlay = new OverlayWindow();
             overlay.show();
+            if (Config.ensureEnvFile() || Config.get("LLM_API_KEY", null) == null) {
+                overlay.setStatus("First run: add your LLM_API_KEY to " + AppDirs.path(".env") + " and restart the app.");
+            }
 
             Hotkeys hotkeys = new Hotkeys()
                 .on(Hotkeys.Action.TOGGLE_VISIBLE, () -> SwingUtilities.invokeLater(overlay::toggleVisible))
@@ -26,8 +29,8 @@ public final class Main {
                 hotkeys.install();
                 Runtime.getRuntime().addShutdownHook(new Thread(hotkeys::uninstall));
             } catch (NativeHookException e) {
-                overlay.setStatus("Global hotkeys unavailable (" + e.getMessage()
-                    + "). Grant Accessibility permission to your terminal; buttons still work.");
+                overlay.setStatus("Hotkeys need Accessibility permission (" + e.getMessage() + "). System Settings → Privacy & Security → "
+                    + "Accessibility: if this app is listed, remove it with (−) and add it again, then restart. Buttons still work.");
             }
         });
     }
