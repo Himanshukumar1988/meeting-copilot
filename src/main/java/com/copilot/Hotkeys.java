@@ -25,6 +25,18 @@ public final class Hotkeys {
 
     /** Installs the global hook; throws if the OS refuses (e.g. Accessibility permission missing). */
     public void install() throws NativeHookException {
+        // JNativeHook unpacks its native library next to the jar by default. Inside the installed .app that
+        // writes into the signed bundle, which breaks the signature, and macOS then drops the Accessibility grant.
+        // Unpack it into the app's data folder instead. Must be set before GlobalScreen is first initialised.
+        if (System.getProperty("jnativehook.lib.path") == null) {
+            java.nio.file.Path libDir = AppDirs.path(".bin");
+            try {
+                java.nio.file.Files.createDirectories(libDir);
+                System.setProperty("jnativehook.lib.path", libDir.toString());
+            } catch (java.io.IOException e) {
+                System.setProperty("jnativehook.lib.path", System.getProperty("java.io.tmpdir"));
+            }
+        }
         Logger log = Logger.getLogger(GlobalScreen.class.getPackage().getName());
         log.setLevel(Level.WARNING);
         log.setUseParentHandlers(false);

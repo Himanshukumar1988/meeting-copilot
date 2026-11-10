@@ -15,6 +15,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 
 /** Client for the Paytm inference gateway chat endpoint. */
@@ -24,16 +25,14 @@ public final class Llm {
      * @param selection text the user highlighted in the transcript/chat/suggestion; when present it is the
      *                  main subject and the transcript and chat are only background
      */
-    public record Input(String mode, String transcript, String chat, String question, String imageDataUrl, String selection,
+    /**
+     * @param images     screenshots as data URLs, in the order they were taken (empty: none)
+     * @param screenText text read from the screenshots, sent instead of the images when present
+     */
+    public record Input(String mode, String transcript, String chat, String question, List<String> images, String selection,
                         String screenText) {
-        /** Convenience for callers without a screenshot text. */
-        public Input(String mode, String transcript, String chat, String question, String imageDataUrl, String selection) {
-            this(mode, transcript, chat, question, imageDataUrl, selection, null);
-        }
-
-        /** Convenience for callers without a selection. */
-        public Input(String mode, String transcript, String chat, String question, String imageDataUrl) {
-            this(mode, transcript, chat, question, imageDataUrl, null, null);
+        public Input {
+            images = images == null ? List.of() : List.copyOf(images);
         }
     }
 
@@ -62,11 +61,15 @@ public final class Llm {
         append(user, "# Meeting chat" + background, in.chat());
         append(user, "# Live transcript (most recent last)" + background, in.transcript());
         boolean hasScreenText = in.screenText() != null && !in.screenText().isBlank();
-        if (hasScreenText) append(user, "# Text read from the user's screenshot (OCR, may contain small errors)", in.screenText());
+        if (hasScreenText) append(user, "# Text read from the user's screenshots (OCR, may contain small errors)", in.screenText());
         append(user, "# User request", in.question());
-        boolean hasImage = in.imageDataUrl() != null;
+        boolean hasImage = !in.images().isEmpty();
         if (user.isEmpty() && hasScreenText) user.append("# User request\nSolve or answer what the screenshot text shows.");
-        else if (user.isEmpty() && hasImage) user.append("# User request\nSolve or answer what the attached screenshot shows.");
+        else if (user.isEmpty() && hasImage) user.append("# User request\nSolve or answer what the attached screenshots show.");
+        if (in.images().size() > 1) {
+            user.append("\n\n").append(in.images().size()).append(" screenshots are attached, in the order they were taken. ")
+                .append("They may be parts of one long page or problem: read them together.");
+        }
         else if (user.isEmpty()) user.append("# User request\nNo context yet. Say what you need.");
 
         JsonArray messages = new JsonArray();
@@ -75,20 +78,29 @@ public final class Llm {
             system += " The user highlighted a passage under 'Selected text': base your answer on that passage, "
                 + "and use the other sections only as background context.";
         }
+        if (hasScreenText) {
+            system += " The screenshot text was read by OCR, so it can contain recognition errors: wrong or missing "
+                + "quotes and punctuation, confused characters (l/1/I, O/0, ' / \"), and lines cut off at the edge of "
+                + "the captured area. Silently read past such errors and interpret the text as the author most likely "
+                + "wrote it. Never report a typo, quote, bracket or truncation problem as a bug in the user's code "
+                + "unless the text clearly shows a real mistake; if you are unsure, assume the code is correct.";
+        }
         messages.add(message("system", system));
         if (hasImage) {
-            // OpenAI-style multimodal content: a text part plus an image_url part (data URL).
+            // OpenAI-style multimodal content: a text part plus one image_url part (data URL) per screenshot.
             JsonArray parts = new JsonArray();
             JsonObject text = new JsonObject();
             text.addProperty("type", "text");
             text.addProperty("text", user.toString());
-            JsonObject url = new JsonObject();
-            url.addProperty("url", in.imageDataUrl());
-            JsonObject image = new JsonObject();
-            image.addProperty("type", "image_url");
-            image.add("image_url", url);
             parts.add(text);
-            parts.add(image);
+            for (String dataUrl : in.images()) {
+                JsonObject url = new JsonObject();
+                url.addProperty("url", dataUrl);
+                JsonObject image = new JsonObject();
+                image.addProperty("type", "image_url");
+                image.add("image_url", url);
+                parts.add(image);
+            }
             JsonObject m = new JsonObject();
             m.addProperty("role", "user");
             m.add("content", parts);
@@ -166,7 +178,7 @@ public final class Llm {
     // Text requests use the normal model; image requests need a vision-capable one.
     private static Config.Settings settingsFor(Input in) {
         Config.Settings cfg = Config.load();
-        if (in.imageDataUrl() == null) return cfg;
+        if (in.images().isEmpty()) return cfg;
         return new Config.Settings(cfg.apiKey(), cfg.baseUrl(), Config.get("LLM_VISION_MODEL", "al-gpt-5"));
     }
 

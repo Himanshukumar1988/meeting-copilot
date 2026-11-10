@@ -71,8 +71,43 @@ public final class MacWindow {
             Function sel = objc.getFunction("sel_registerName");
             Pointer app = send.invokePointer(new Object[] {
                 cls.invokePointer(new Object[] {"NSApplication"}), sel.invokePointer(new Object[] {"sharedApplication"})});
+            // macOS 14+ deprecated activateIgnoringOtherApps: (it may be ignored); use activate when available.
+            Pointer activate = sel.invokePointer(new Object[] {"activate"});
+            boolean hasActivate = (send.invokeInt(new Object[] {app, sel.invokePointer(new Object[] {"respondsToSelector:"}), activate}) & 0xff) != 0;
+            if (hasActivate) send.invokeVoid(new Object[] {app, activate});
             send.invokeVoid(new Object[] {app, sel.invokePointer(new Object[] {"activateIgnoringOtherApps:"}), 1L});
+            // An accessory (no Dock icon) app's window does not always become key on activation; ask directly.
+            Pointer windows = send.invokePointer(new Object[] {app, sel.invokePointer(new Object[] {"windows"})});
+            long count = send.invokeLong(new Object[] {windows, sel.invokePointer(new Object[] {"count"})});
+            Pointer at = sel.invokePointer(new Object[] {"objectAtIndex:"});
+            Pointer isVisible = sel.invokePointer(new Object[] {"isVisible"});
+            Pointer canBecomeKey = sel.invokePointer(new Object[] {"canBecomeKeyWindow"});
+            Pointer makeKey = sel.invokePointer(new Object[] {"makeKeyWindow"});
+            for (long i = 0; i < count; i++) {
+                Pointer w = send.invokePointer(new Object[] {windows, at, i});
+                boolean visible = (send.invokeInt(new Object[] {w, isVisible}) & 0xff) != 0;
+                boolean keyable = (send.invokeInt(new Object[] {w, canBecomeKey}) & 0xff) != 0;
+                if (visible && keyable) send.invokeVoid(new Object[] {w, makeKey});
+            }
         });
+    }
+
+    /** For diagnostics: whether macOS considers this app active and one of its windows the key window. */
+    public static String activationState() {
+        if (!MAC) return "n/a";
+        try {
+            NativeLibrary objc = NativeLibrary.getInstance("objc");
+            Function send = objc.getFunction("objc_msgSend");
+            Function cls = objc.getFunction("objc_getClass");
+            Function sel = objc.getFunction("sel_registerName");
+            Pointer app = send.invokePointer(new Object[] {
+                cls.invokePointer(new Object[] {"NSApplication"}), sel.invokePointer(new Object[] {"sharedApplication"})});
+            boolean active = (send.invokeInt(new Object[] {app, sel.invokePointer(new Object[] {"isActive"})}) & 0xff) != 0;
+            Pointer key = send.invokePointer(new Object[] {app, sel.invokePointer(new Object[] {"keyWindow"})});
+            return "appActive=" + active + " hasKeyWindow=" + (key != null);
+        } catch (Throwable t) {
+            return "unknown (" + t + ")";
+        }
     }
 
     private interface ThrowingRunnable { void run() throws Throwable; }

@@ -76,8 +76,19 @@ public final class OverlayWindow {
     private final ExecutorService llmWorker = Executors.newSingleThreadExecutor(daemon("llm"));
 
     private final JButton snapBtn = new JButton("Snap");
-    private volatile ScreenSnap.Snap snapshot;
-    private volatile String snapshotText; // OCR of the snapshot; when long enough it replaces sending the image
+    private final JButton lensBtn = small("Lens"); // reverse image search of the attached snap
+    /** One attached screenshot. Its text is filled in by OCR shortly after it is taken. */
+    private static final class Shot {
+        final ScreenSnap.Snap snap;
+        volatile String text;       // OCR text; null while reading, or when the image itself must be sent
+        volatile boolean imageOnly; // code or graphics: the image is sent even if text was read
+        Shot(ScreenSnap.Snap snap) { this.snap = snap; }
+        boolean usableAsText() { return !imageOnly && text != null && text.length() >= Ocr.MIN_USEFUL_CHARS; }
+    }
+
+    private static final int MAX_SNAPS = 5; // more images make the request large and the vision model slow
+    // Snaps waiting for the next Suggest, oldest first. Snap adds one; Suggest uses them all; right-click Snap drops them.
+    private final java.util.List<Shot> snaps = new java.util.concurrent.CopyOnWriteArrayList<>();
     private volatile boolean refreshPending;
     private volatile boolean translateToEnglish;
     private volatile boolean autoSuggest;
@@ -167,13 +178,14 @@ public final class OverlayWindow {
         String selectedMode = (String) mode.getSelectedItem();
         int lines = "reply".equals(selectedMode) ? REPLY_LINES : MAX_LINES;
         String selection = auto ? null : takeSelection();
-        // Enough text on the screenshot: send just the text to the fast model; otherwise send the image.
-        boolean useOcr = !auto && snapshotText != null && snapshotText.length() >= Ocr.MIN_USEFUL_CHARS;
         String asked = auto ? "Reply to the latest question or request from the other side: " + autoQuestion : question.getText();
-        boolean withImage = !auto && snapshot != null;
+        java.util.List<Shot> shots = auto ? java.util.List.of() : java.util.List.copyOf(snaps);
+        // Every snap has enough plain text: send just the text to the fast model. Otherwise (code, graphics, or
+        // text still being read) send all the images to the vision model, so the snaps are read the same way.
+        boolean useOcr = !shots.isEmpty() && shots.stream().allMatch(Shot::usableAsText);
+        java.util.List<String> images = useOcr ? java.util.List.of() : shots.stream().map(s -> s.snap.dataUrl()).toList();
         Llm.Input in = new Llm.Input(selectedMode, tail(transcript.lines(), lines), tail(chat, lines), asked,
-            useOcr || !withImage ? null : snapshot.dataUrl(), selection, useOcr ? snapshotText : null);
-        boolean sendingImage = withImage; // also true for the OCR path: the screenshot is used up either way
+            images, selection, useOcr ? screenText(shots) : null);
         setStatus(auto ? "Auto-suggestion for: " + autoQuestion
             : selection == null ? "Thinking…" : "Thinking about the selected text (" + selection.length() + " chars)…");
         setSuggestionVisible(true); // expand the suggestion area (transcript shrinks to 40%)
@@ -197,7 +209,8 @@ public final class OverlayWindow {
                 if (id != suggestId) return; // cancelled or superseded while the reply was arriving
                 SwingUtilities.invokeLater(() -> renderAnswer(text.isEmpty() ? "(empty response)" : text));
                 setStatus("Done.");
-                if (sendingImage) clearSnap(); // the image belongs to this request only
+                // The snaps belong to this request only. Snaps taken while it was running stay for the next one.
+                if (!shots.isEmpty()) { snaps.removeAll(shots); updateSnapButton(); }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt(); // cancelled: cancelSuggest() already updated the UI
             } catch (Exception e) {
@@ -374,35 +387,90 @@ public final class OverlayWindow {
             java.awt.Rectangle r = region.intersection(new java.awt.Rectangle(0, 0, shot.getWidth(), shot.getHeight()));
             java.awt.image.BufferedImage crop = shot.getSubimage(r.x, r.y, r.width, r.height);
             ScreenSnap.Snap s = ScreenSnap.encode(crop);
-            snapshot = s;
-            snapshotText = null;
-            SwingUtilities.invokeLater(() -> snapBtn.setText("Snap ✓"));
-            setStatus("Screenshot attached (" + s.width() + "x" + s.height() + "). Reading its text…");
+            Shot shotEntry = new Shot(s);
+            boolean droppedOldest = false;
+            synchronized (snaps) {
+                if (snaps.size() >= MAX_SNAPS) { snaps.remove(0); droppedOldest = true; }
+                snaps.add(shotEntry);
+            }
+            updateSnapButton();
+            String which = "Screenshot " + snaps.size() + " of max " + MAX_SNAPS
+                + (droppedOldest ? " (the oldest was dropped)" : "") + " attached (" + s.width() + "x" + s.height() + ")";
+            String tail = " Snap again to add more; right-click Snap to drop them.";
+            setStatus(which + ". Reading its text…");
             if (!Ocr.enabled()) {
-                setStatus("Screenshot attached (" + s.width() + "x" + s.height() + "). Sent with the next Suggest; right-click Snap to drop it.");
+                shotEntry.imageOnly = true;
+                setStatus(which + ". Sent with the next Suggest." + tail);
                 return;
             }
             // Reading the text now means it is ready (and fast to use) by the time Suggest is pressed.
             try {
                 long t0 = System.nanoTime();
                 String text = Ocr.read(crop);
-                snapshotText = text;
+                if (Ocr.shouldSendImageInstead(text)) {
+                    // Code: OCR mangles symbols and the model then reports bugs that aren't there. Send the image.
+                    shotEntry.imageOnly = true;
+                    setStatus(which + ": looks like code, so the image itself will be sent for an exact reading "
+                        + "(slower than fast mode)." + tail);
+                    return;
+                }
+                shotEntry.text = text;
+                if (text.length() < Ocr.MIN_USEFUL_CHARS) shotEntry.imageOnly = true;
                 setStatus(text.length() >= Ocr.MIN_USEFUL_CHARS
-                    ? "Screenshot attached: " + text.length() + " characters of text read in "
-                        + Math.round((System.nanoTime() - t0) / 1e8) / 10.0 + "s (fast mode). Right-click Snap to drop it."
-                    : "Screenshot attached (little text found, so the image itself will be sent). Right-click Snap to drop it.");
+                    ? which + ": " + text.length() + " characters of text read in "
+                        + Math.round((System.nanoTime() - t0) / 1e8) / 10.0 + "s (fast mode)." + tail
+                    : which + " (little text found, so the image itself will be sent)." + tail);
             } catch (Exception e) {
-                setStatus("Screenshot attached (text reading unavailable: " + e.getMessage() + "); the image will be sent.");
+                shotEntry.imageOnly = true;
+                setStatus(which + " (text reading unavailable: " + e.getMessage() + "); the image will be sent." + tail);
             }
         } catch (Exception e) {
             setStatus("Screenshot failed: " + e.getMessage());
         }
     }
 
+    // The OCR text of several snaps, each under its own heading so the model knows where one ends.
+    private static String screenText(java.util.List<Shot> shots) {
+        if (shots.size() == 1) return shots.get(0).text;
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < shots.size(); i++) {
+            if (i > 0) sb.append("\n\n");
+            sb.append("## Screenshot ").append(i + 1).append(" of ").append(shots.size()).append('\n').append(shots.get(i).text);
+        }
+        return sb.toString();
+    }
+
+    // "Snap" with nothing attached, "Snap ✓" with one, "Snap ✓ 3" with several. Lens shows while any is attached.
+    private void updateSnapButton() {
+        int n = snaps.size();
+        SwingUtilities.invokeLater(() -> {
+            snapBtn.setText(n == 0 ? "Snap" : n == 1 ? "Snap ✓" : "Snap ✓ " + n);
+            lensBtn.setVisible(n > 0);
+            lensBtn.getParent().revalidate();
+        });
+    }
+
     private void clearSnap() {
-        snapshot = null;
-        snapshotText = null;
-        SwingUtilities.invokeLater(() -> snapBtn.setText("Snap"));
+        snaps.clear();
+        updateSnapButton();
+    }
+
+    /** Reverse-searches the latest attached screenshot with Google Lens, in the browser. Uploads the image to Google. */
+    public void searchSnap() {
+        java.util.List<Shot> current = java.util.List.copyOf(snaps);
+        ScreenSnap.Snap s = current.isEmpty() ? null : current.get(current.size() - 1).snap;
+        if (s == null) { setStatus("Snap a region first, then press Lens to search for it."); return; }
+        setStatus("Searching the screenshot with Google Lens…");
+        new Thread(() -> {
+            try {
+                ImageSearch.Result r = ImageSearch.search(s.dataUrl());
+                setStatus(r == ImageSearch.Result.OPENED
+                    ? "Google Lens results opened in your browser."
+                    : "Lens upload failed; opened Google Lens with the screenshot on the clipboard. Paste it there (Cmd+V).");
+            } catch (Exception e) {
+                setStatus("Image search failed: " + e.getMessage());
+            }
+        }, "image-search").start();
     }
 
     /** Adds the clipboard text (copied meeting chat) to the chat context. */
@@ -660,6 +728,14 @@ public final class OverlayWindow {
                 c.requestFocusInWindow();
                 // Activation is asynchronous; retry the focus request once the app is active.
                 new javax.swing.Timer(150, ev -> c.requestFocusInWindow()) {{ setRepeats(false); start(); }};
+                if (c == question) {
+                    new javax.swing.Timer(400, ev -> {
+                        if (!c.hasFocus()) { frame.toFront(); c.requestFocus(); } // last resort
+                        log("FOCUS question click: focusable=" + frame.getFocusableWindowState() + " windowFocused="
+                            + frame.isFocused() + " boxFocused=" + c.hasFocus() + " editable=" + c.isEditable()
+                            + " " + MacWindow.activationState());
+                    }) {{ setRepeats(false); start(); }};
+                }
             }
         });
     }
@@ -754,11 +830,15 @@ public final class OverlayWindow {
             }
         });
 
+        lensBtn.setVisible(false); // only shown while a screenshot is attached, to keep the header narrow
+        lensBtn.setToolTipText("Reverse image search of the latest snap in Google Lens (uploads it to Google)");
+        lensBtn.addActionListener(e -> searchSnap());
+
         JPanel header = new JPanel(new BorderLayout(6, 0));
         header.setOpaque(false);
         JPanel buttons = new JPanel();
         buttons.setOpaque(false);
-        buttons.add(mode); buttons.add(mic); buttons.add(snapBtn); buttons.add(chatBtn); buttons.add(goBtn);
+        buttons.add(mode); buttons.add(mic); buttons.add(snapBtn); buttons.add(lensBtn); buttons.add(chatBtn); buttons.add(goBtn);
         header.add(title, BorderLayout.WEST);
         header.add(buttons, BorderLayout.EAST);
 

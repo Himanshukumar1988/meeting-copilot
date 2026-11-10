@@ -59,9 +59,14 @@ build_one() {
 
   # Ad-hoc signing ("-") gives every build a new identity, so macOS forgets the permissions you granted. Set
   # SIGN_IDENTITY to a certificate name to keep one stable identity across rebuilds (see the README).
+  # Uses "Meeting Copilot Dev" automatically when it exists (create it once with ./make-signing-cert.sh).
+  if [ -z "$SIGN_IDENTITY" ] && security find-identity -v -p codesigning | grep -q '"Meeting Copilot Dev"'; then
+    SIGN_IDENTITY="Meeting Copilot Dev"
+  fi
   SIGN="${SIGN_IDENTITY:--}"
   codesign --force --deep --sign "$SIGN" "$OUT/$APP.app"
-  [ "$SIGN" = "-" ] && echo "    NOTE: ad-hoc signed. After each rebuild, remove and re-add the app under Privacy & Security."
+  [ "$SIGN" = "-" ] && echo "    NOTE: ad-hoc signed. After each rebuild, remove and re-add the app under Privacy & Security." \
+    "Run ./make-signing-cert.sh once to fix this permanently."
 
   # ditto keeps the signature intact (a plain Finder "Compress" can break it)
   ditto -c -k --sequesterRsrc --keepParent "$OUT/$APP.app" "dist/Meeting-Copilot-$VERSION-$ARCH.zip"

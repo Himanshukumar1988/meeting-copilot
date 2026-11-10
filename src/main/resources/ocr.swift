@@ -13,7 +13,8 @@ guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
 
 let request = VNRecognizeTextRequest()
 request.recognitionLevel = .accurate
-request.usesLanguageCorrection = true
+// Off: the dictionary "fixes" code (quotes, brackets, identifiers) into wrong characters, and snaps are often code.
+request.usesLanguageCorrection = false
 request.automaticallyDetectsLanguage = true
 
 do { try VNImageRequestHandler(cgImage: image, options: [:]).perform([request]) }
