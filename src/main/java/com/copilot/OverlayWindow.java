@@ -51,6 +51,9 @@ public final class OverlayWindow {
 
     private final JFrame frame = new JFrame("Copilot");
     private final JComboBox<String> mode = new JComboBox<>(new String[] {"reply", "code", "design"});
+    // Language for Code mode answers; Java by default. Only shown while Code mode is selected.
+    private final JComboBox<String> language = new JComboBox<>(new String[] {
+        "Java", "Python", "C++", "JavaScript", "TypeScript", "Go", "Kotlin", "C#", "SQL"});
     private final JButton mic = new JButton("Mic: off");
     private final JTextArea transcriptBox = box(110);
     private final JTextArea chatBox = box(80);
@@ -106,6 +109,12 @@ public final class OverlayWindow {
     private JScrollPane answerScroll;
     private JButton answerToggle;
     private JPanel columnPanel;
+    private JPanel answerHead;         // "Suggestion" label and its buttons
+    private JScrollPane questionScroll;
+    private final JButton popBtn = small("Pop out");
+    private JFrame popout;             // non-null while the suggestion is in its own window
+    private int popoutOpacity = 100;   // percent, kept between pop-outs
+    private static final int MIN_OPACITY = 20;
     private JButton chatToggle;
     private final JButton goBtn = new JButton("Suggest");
     private final JButton answerGoBtn = small("Suggest"); // same action, next to the suggestion area
@@ -142,8 +151,10 @@ public final class OverlayWindow {
     }
 
     public void toggleVisible() {
-        if (frame.isVisible()) frame.setVisible(false);
-        else frame.setVisible(true);
+        boolean show = !frame.isVisible();
+        frame.setVisible(show);
+        if (popout != null) popout.setVisible(show);
+        if (show) MacWindow.setContentProtection(true);
     }
 
     public void setStatus(String msg) {
@@ -185,7 +196,8 @@ public final class OverlayWindow {
         boolean useOcr = !shots.isEmpty() && shots.stream().allMatch(Shot::usableAsText);
         java.util.List<String> images = useOcr ? java.util.List.of() : shots.stream().map(s -> s.snap.dataUrl()).toList();
         Llm.Input in = new Llm.Input(selectedMode, tail(transcript.lines(), lines), tail(chat, lines), asked,
-            images, selection, useOcr ? screenText(shots) : null);
+            images, selection, useOcr ? screenText(shots) : null,
+            "code".equals(selectedMode) ? (String) language.getSelectedItem() : null);
         setStatus(auto ? "Auto-suggestion for: " + autoQuestion
             : selection == null ? "Thinking…" : "Thinking about the selected text (" + selection.length() + " chars)…");
         setSuggestionVisible(true); // expand the suggestion area (transcript shrinks to 40%)
@@ -328,8 +340,9 @@ public final class OverlayWindow {
 
     /**
      * Lets the user select a screen region (or the whole screen) and attaches it to the next Suggest.
-     * On macOS this uses the system's own selector (screencapture -i), which works over any app, including
-     * full-screen ones; set SNAP_PICKER=builtin to use the in-app selector instead (also used off macOS).
+     * Uses the in-app selector, which is hidden from screen share like the overlay, so people watching the
+     * share do not see the selection. SNAP_PICKER=native uses macOS's own selector (screencapture -i) instead,
+     * but that one is drawn by the system and shows up in screen share.
      */
     public void snap() {
         if (!MacWindow.hasScreenCaptureAccess()) {
@@ -341,7 +354,7 @@ public final class OverlayWindow {
         setStatus("Select the area to capture… (Esc cancels)");
         new Thread(() -> {
             try {
-                if (MacWindow.isMac() && !"builtin".equals(Config.get("SNAP_PICKER", "native"))) {
+                if (MacWindow.isMac() && "native".equals(Config.get("SNAP_PICKER", "builtin"))) {
                     if (snapNative()) return;
                 }
                 java.awt.image.BufferedImage shot = ScreenSnap.grab();
@@ -713,17 +726,23 @@ public final class OverlayWindow {
      * app in front of Chrome). A text component is the exception: the window becomes focusable while the pointer
      * is over it or it has focus, so clicking works normally for typing, selecting and copying.
      */
+    // The window a component is currently in: the overlay, or the popped-out suggestion window.
+    private java.awt.Window windowOf(java.awt.Component c) {
+        java.awt.Window w = SwingUtilities.getWindowAncestor(c);
+        return w != null ? w : frame;
+    }
+
     private void focusOnHover(javax.swing.text.JTextComponent c) {
         c.addFocusListener(new java.awt.event.FocusAdapter() {
             @Override public void focusLost(java.awt.event.FocusEvent e) {
-                if (c.getMousePosition() == null) frame.setFocusableWindowState(false);
+                if (c.getMousePosition() == null) windowOf(c).setFocusableWindowState(false);
             }
         });
         c.addMouseListener(new MouseAdapter() {
-            @Override public void mouseEntered(MouseEvent e) { frame.setFocusableWindowState(true); }
-            @Override public void mouseExited(MouseEvent e) { if (!c.hasFocus()) frame.setFocusableWindowState(false); }
+            @Override public void mouseEntered(MouseEvent e) { windowOf(c).setFocusableWindowState(true); }
+            @Override public void mouseExited(MouseEvent e) { if (!c.hasFocus()) windowOf(c).setFocusableWindowState(false); }
             @Override public void mousePressed(MouseEvent e) {
-                frame.setFocusableWindowState(true);
+                windowOf(c).setFocusableWindowState(true);
                 MacWindow.activateApp();
                 c.requestFocusInWindow();
                 // Activation is asynchronous; retry the focus request once the app is active.
@@ -799,8 +818,9 @@ public final class OverlayWindow {
         return "Hotkeys (" + k + "+Shift+): Space hide · C paste chat · Enter suggest · M mic · S snap · X click-through";
     }
 
-    private JPanel buildPanel() {
-        JPanel panel = new JPanel(new WeightedColumn()) {
+    // The translucent rounded background shared by the overlay and the popped-out suggestion window.
+    private static JPanel roundedPanel(java.awt.LayoutManager layout) {
+        JPanel panel = new JPanel(layout) {
             @Override
             protected void paintComponent(Graphics g) {
                 Graphics2D g2 = (Graphics2D) g.create();
@@ -814,7 +834,12 @@ public final class OverlayWindow {
         };
         panel.setOpaque(false);
         panel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
-        makeDraggable(panel);
+        return panel;
+    }
+
+    private JPanel buildPanel() {
+        JPanel panel = roundedPanel(new WeightedColumn());
+        makeDraggable(panel, frame);
 
         JLabel title = new JLabel("Copilot");
         title.setForeground(FG);
@@ -838,7 +863,15 @@ public final class OverlayWindow {
         header.setOpaque(false);
         JPanel buttons = new JPanel();
         buttons.setOpaque(false);
-        buttons.add(mode); buttons.add(mic); buttons.add(snapBtn); buttons.add(lensBtn); buttons.add(chatBtn); buttons.add(goBtn);
+        language.setSelectedItem("Java");
+        language.setToolTipText("Language for the code in Code mode answers");
+        language.setVisible("code".equals(mode.getSelectedItem()));
+        mode.addActionListener(e -> {
+            language.setVisible("code".equals(mode.getSelectedItem()));
+            buttons.revalidate();
+            buttons.repaint();
+        });
+        buttons.add(mode); buttons.add(language); buttons.add(mic); buttons.add(snapBtn); buttons.add(lensBtn); buttons.add(chatBtn); buttons.add(goBtn);
         header.add(title, BorderLayout.WEST);
         header.add(buttons, BorderLayout.EAST);
 
@@ -900,7 +933,7 @@ public final class OverlayWindow {
         add(panel, inputBox, 0, 1, 0); // audio source on its own row: the header has no room for its long names
         // Heights share the spare space by weight: transcript 40%, suggestion 40%, chat 10%, input 10%.
         // Preferred heights are equal and small so only the weights decide the split.
-        JScrollPane questionScroll = scroll(question, PANE_BASE_HEIGHT);
+        questionScroll = scroll(question, PANE_BASE_HEIGHT);
         questionScroll.setBorder(BorderFactory.createEmptyBorder());
         columnPanel = panel;
         transcriptScroll = scroll(transcriptBox, PANE_BASE_HEIGHT);
@@ -911,7 +944,7 @@ public final class OverlayWindow {
         answerScroll = scroll(answer, PANE_BASE_HEIGHT);
         answerToggle = small("Show");
         answerToggle.addActionListener(e -> setSuggestionVisible(!answerScroll.isVisible()));
-        JPanel answerHead = new JPanel(new BorderLayout());
+        answerHead = new JPanel(new BorderLayout());
         answerHead.setOpaque(false);
         answerHead.add(label("Suggestion"), BorderLayout.WEST);
         JButton copyAnswer = small("Copy");
@@ -924,6 +957,9 @@ public final class OverlayWindow {
         aRight.add(autoBtn);
         aRight.add(answerGoBtn);
         aRight.add(copyAnswer);
+        popBtn.setToolTipText("Move the suggestion into its own window in the middle of the screen (Dock puts it back)");
+        popBtn.addActionListener(e -> { if (popout == null) popOutSuggestion(); else dockSuggestion(); });
+        aRight.add(popBtn);
         aRight.add(answerToggle);
         answerHead.add(aRight, BorderLayout.EAST);
         add(panel, answerHead, 0, 5, 0);
@@ -978,12 +1014,116 @@ public final class OverlayWindow {
     /** Collapses or expands the meeting chat box (the chat is still sent to the model while hidden). */
     /** Shows or hides the suggestion area; hidden, the live transcript takes 80% of the pane space, shown 40/40. */
     public void setSuggestionVisible(boolean show) {
+        if (popout != null) { // popped out: the suggestion window is always open; just bring it back if hidden
+            if (show && !popout.isVisible() && frame.isVisible()) { popout.setVisible(true); protectWindows(); }
+            return;
+        }
         answerScroll.setVisible(show);
         answerToggle.setText(show ? "Hide" : "Show");
         ((WeightedColumn) columnPanel.getLayout()).weights.put(transcriptScroll,
             show ? TRANSCRIPT_WEIGHT_SHARED : TRANSCRIPT_WEIGHT_ALONE);
         columnPanel.revalidate();
         columnPanel.repaint();
+    }
+
+    /**
+     * Moves the suggestion (header and answer) out of the overlay into its own larger window in the middle of
+     * the screen, hidden from screen share like the overlay. Dock (or closing it) puts it back.
+     */
+    public void popOutSuggestion() {
+        if (popout != null) return;
+        columnPanel.remove(answerHead);
+        columnPanel.remove(answerScroll);
+        ((WeightedColumn) columnPanel.getLayout()).weights.put(transcriptScroll, TRANSCRIPT_WEIGHT_ALONE);
+        columnPanel.revalidate();
+        columnPanel.repaint();
+
+        answerScroll.setVisible(true);
+        answerToggle.setVisible(false); // the window itself is the suggestion; Dock is the way back
+        popBtn.setText("Dock");
+
+        JFrame w = new JFrame("Copilot suggestion");
+        w.setUndecorated(true);
+        w.setBackground(new Color(0, 0, 0, 0));
+        w.setAlwaysOnTop(true);
+        w.setAutoRequestFocus(false);
+        w.setFocusableWindowState(false); // like the overlay: clicking it never steals focus from the meeting app
+        w.setType(java.awt.Window.Type.UTILITY);
+        w.setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
+        JPanel content = roundedPanel(new BorderLayout(0, 6));
+        content.add(answerHead, BorderLayout.NORTH);
+        content.add(answerScroll, BorderLayout.CENTER);
+        content.add(opacityRow(w), BorderLayout.SOUTH);
+        makeDraggable(content, w);
+        w.setContentPane(content);
+
+        java.awt.Rectangle screen = frame.getGraphicsConfiguration().getBounds();
+        int width = Math.max(520, (int) (screen.width * 0.55)), height = Math.max(400, (int) (screen.height * 0.6));
+        w.setBounds(screen.x + (screen.width - width) / 2, screen.y + (screen.height - height) / 2, width, height);
+        popout = w;
+        w.setOpacity(popoutOpacity / 100f);
+        // Create the native window and hide it from screen share before it is first drawn.
+        w.addNotify();
+        protectWindows();
+        if (frame.isVisible()) w.setVisible(true);
+        protectWindows();
+        setStatus("Suggestion popped out. Double-tap Space to hide/show it; Dock puts it back.");
+    }
+
+    // "Opacity" slider at the bottom of the popped-out window.
+    private JPanel opacityRow(JFrame w) {
+        javax.swing.JSlider slider = new javax.swing.JSlider(MIN_OPACITY, 100, popoutOpacity);
+        slider.setOpaque(false);
+        slider.setFocusable(false);
+        slider.setToolTipText("Opacity of the suggestion window");
+        JLabel value = label(popoutOpacity + "%");
+        slider.addChangeListener(e -> {
+            popoutOpacity = slider.getValue();
+            value.setText(popoutOpacity + "%");
+            w.setOpacity(popoutOpacity / 100f);
+        });
+        JPanel row = new JPanel(new BorderLayout(6, 0));
+        row.setOpaque(false);
+        row.add(label("Opacity"), BorderLayout.WEST);
+        row.add(slider, BorderLayout.CENTER);
+        row.add(value, BorderLayout.EAST);
+        return row;
+    }
+
+    /** Double-tap Space: hides or shows the popped-out suggestion window. Does nothing while docked. */
+    public void togglePopoutVisible() {
+        if (popout == null || !frame.isVisible()) return;
+        boolean show = !popout.isVisible();
+        popout.setVisible(show);
+        if (show) protectWindows();
+    }
+
+    /** Puts the popped-out suggestion back into the overlay, above the question box. */
+    public void dockSuggestion() {
+        if (popout == null) return;
+        JFrame w = popout;
+        popout = null;
+        w.getContentPane().remove(answerHead);
+        w.getContentPane().remove(answerScroll);
+        w.dispose();
+
+        int at = java.util.Arrays.asList(columnPanel.getComponents()).indexOf(questionScroll);
+        WeightedColumn layout = (WeightedColumn) columnPanel.getLayout();
+        layout.weights.put(answerHead, 0.0);
+        layout.weights.put(answerScroll, 4.0);
+        columnPanel.add(answerHead, at);
+        columnPanel.add(answerScroll, at + 1);
+        answerToggle.setVisible(true);
+        popBtn.setText("Pop out");
+        setSuggestionVisible(true);
+        setStatus("Suggestion docked.");
+    }
+
+    // Applies screen-share hiding, all-Spaces and the current click-through setting to every app window.
+    private void protectWindows() {
+        MacWindow.setContentProtection(true);
+        MacWindow.setVisibleOnAllSpaces();
+        if (clickThrough) MacWindow.setClickThrough(true);
     }
 
     public void toggleChatVisible() {
@@ -1075,7 +1215,7 @@ public final class OverlayWindow {
     }
 
     // Drag the panel background to move the borderless window; drag within GRIP px of an edge/corner to resize.
-    private void makeDraggable(JComponent c) {
+    private void makeDraggable(JComponent c, java.awt.Window window) {
         final int grip = 10;
         final int minW = 320, minH = 360;
         final java.awt.Point[] start = new java.awt.Point[1];   // mouse position (screen coords) at press
@@ -1105,13 +1245,13 @@ public final class OverlayWindow {
                     if (r.width < minW) { if ((edge[0] & 1) != 0) r.x -= minW - r.width; r.width = minW; }
                     if (r.height < minH) { if ((edge[0] & 4) != 0) r.y -= minH - r.height; r.height = minH; }
                 }
-                frame.setBounds(r);
+                window.setBounds(r);
             }
         });
         c.addMouseListener(new MouseAdapter() {
             @Override public void mousePressed(MouseEvent e) {
                 start[0] = e.getLocationOnScreen();
-                orig[0] = frame.getBounds();
+                orig[0] = window.getBounds();
                 edge[0] = edgeAt.apply(e.getPoint());
             }
         });

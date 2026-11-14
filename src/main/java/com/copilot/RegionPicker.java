@@ -35,7 +35,12 @@ public final class RegionPicker {
         frame.setBounds(0, 0, shot.getWidth(), shot.getHeight());
         Canvas canvas = new Canvas(shot, r -> { frame.dispose(); done.accept(r); });
         frame.setContentPane(canvas);
+        // Create the native window first so it can be hidden from screen share before it is ever drawn.
+        frame.addNotify();
+        MacWindow.setContentProtection(true);
+        MacWindow.setVisibleOnAllSpaces();
         frame.setVisible(true);
+        MacWindow.setContentProtection(true); // again, in case the window was not registered yet
         frame.toFront();
         canvas.requestFocusInWindow();
     }

@@ -30,7 +30,7 @@ public final class Llm {
      * @param screenText text read from the screenshots, sent instead of the images when present
      */
     public record Input(String mode, String transcript, String chat, String question, List<String> images, String selection,
-                        String screenText) {
+                        String screenText, String language) {
         public Input {
             images = images == null ? List.of() : List.copyOf(images);
         }
@@ -84,6 +84,9 @@ public final class Llm {
                 + "the captured area. Silently read past such errors and interpret the text as the author most likely "
                 + "wrote it. Never report a typo, quote, bracket or truncation problem as a bug in the user's code "
                 + "unless the text clearly shows a real mistake; if you are unsure, assume the code is correct.";
+        }
+        if ("code".equals(in.mode()) && in.language() != null && !in.language().isBlank()) {
+            system += " Write all code in " + in.language() + " unless the user explicitly asks for another language.";
         }
         messages.add(message("system", system));
         if (hasImage) {

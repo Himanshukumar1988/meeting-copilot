@@ -24,7 +24,8 @@ public final class Main {
                 .on(Hotkeys.Action.SUGGEST, () -> SwingUtilities.invokeLater(overlay::suggest))
                 .on(Hotkeys.Action.TOGGLE_MIC, () -> SwingUtilities.invokeLater(overlay::toggleMic))
                 .on(Hotkeys.Action.TOGGLE_CLICK_THROUGH, () -> SwingUtilities.invokeLater(overlay::toggleClickThrough))
-                .on(Hotkeys.Action.SNAP, overlay::snap);
+                .on(Hotkeys.Action.SNAP, overlay::snap)
+                .on(Hotkeys.Action.DOUBLE_SPACE, () -> SwingUtilities.invokeLater(overlay::togglePopoutVisible));
             try {
                 hotkeys.install();
                 Runtime.getRuntime().addShutdownHook(new Thread(hotkeys::uninstall));

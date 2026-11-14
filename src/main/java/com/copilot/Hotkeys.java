@@ -14,9 +14,16 @@ import java.util.logging.Logger;
  * On macOS this requires Accessibility permission for the terminal/JVM that launches the app.
  */
 public final class Hotkeys {
-    public enum Action { TOGGLE_VISIBLE, INGEST_CHAT, SUGGEST, TOGGLE_MIC, TOGGLE_CLICK_THROUGH, SNAP }
+    public enum Action { TOGGLE_VISIBLE, INGEST_CHAT, SUGGEST, TOGGLE_MIC, TOGGLE_CLICK_THROUGH, SNAP, DOUBLE_SPACE }
 
+    private static final long DOUBLE_TAP_MS = 350;
     private final Map<Action, Runnable> handlers = new EnumMap<>(Action.class);
+    // Double-tap Space detection. Holding Space repeats key presses, so a press only counts after a release.
+    private boolean spaceDown;
+    private long lastSpaceTap;
+
+    private static final int ANY_MODIFIER = NativeKeyEvent.SHIFT_MASK | NativeKeyEvent.CTRL_MASK
+        | NativeKeyEvent.ALT_MASK | NativeKeyEvent.META_MASK;
 
     public Hotkeys on(Action action, Runnable handler) {
         handlers.put(action, handler);
@@ -45,6 +52,20 @@ public final class Hotkeys {
             @Override
             public void nativeKeyPressed(NativeKeyEvent e) {
                 int mods = e.getModifiers();
+                if (e.getKeyCode() == NativeKeyEvent.VC_SPACE && (mods & ANY_MODIFIER) == 0) {
+                    if (spaceDown) return; // key repeat
+                    spaceDown = true;
+                    long now = System.currentTimeMillis();
+                    if (now - lastSpaceTap <= DOUBLE_TAP_MS) {
+                        lastSpaceTap = 0;
+                        Runnable h = handlers.get(Action.DOUBLE_SPACE);
+                        if (h != null) h.run();
+                    } else {
+                        lastSpaceTap = now;
+                    }
+                    return;
+                }
+                lastSpaceTap = 0; // any other key in between: not a double tap
                 int main = MacWindow.isMac() ? NativeKeyEvent.META_MASK : NativeKeyEvent.CTRL_MASK;
                 if ((mods & main) == 0 || (mods & NativeKeyEvent.SHIFT_MASK) == 0) return;
                 Action action = switch (e.getKeyCode()) {
@@ -58,6 +79,11 @@ public final class Hotkeys {
                 };
                 Runnable h = action == null ? null : handlers.get(action);
                 if (h != null) h.run();
+            }
+
+            @Override
+            public void nativeKeyReleased(NativeKeyEvent e) {
+                if (e.getKeyCode() == NativeKeyEvent.VC_SPACE) spaceDown = false;
             }
         });
     }
