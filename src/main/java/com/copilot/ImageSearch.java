@@ -7,32 +7,27 @@ import java.awt.datatransfer.DataFlavor;
 import java.awt.datatransfer.Transferable;
 import java.awt.datatransfer.UnsupportedFlavorException;
 import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
-import java.time.Duration;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Base64;
-import java.util.UUID;
 import javax.imageio.ImageIO;
 
 /**
- * Reverse image search: uploads a snapped screenshot to Google Lens and opens the results in the browser.
- * Lens has no official API; its web upload endpoint answers with a redirect to the results page. If that
- * fails, the image is put on the clipboard and Lens is opened so the user can paste it (Cmd+V).
+ * Reverse image search: sends a snapped screenshot to Google Lens and shows the results in the browser.
+ *
+ * The browser itself must do the upload. Lens ties a search to the session that uploaded the image, so a
+ * results link obtained by uploading from this app opens in the browser as "expired visual search". Instead a
+ * small temporary page is opened that posts the image to Lens from the browser (the same way Lens's own
+ * upload form does). If that page can't be written, the image goes on the clipboard and Lens is opened so the
+ * user can paste it (Cmd+V).
  */
 public final class ImageSearch {
     private static final String UPLOAD_URL = "https://lens.google.com/v3/upload?hl=en&ep=ccm&st=";
     private static final String FALLBACK_URL = "https://lens.google.com/";
-    private static final String USER_AGENT =
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36";
-    private static final HttpClient HTTP = HttpClient.newBuilder()
-        .connectTimeout(Duration.ofSeconds(10))
-        .followRedirects(HttpClient.Redirect.NEVER) // we want the redirect target, not the page itself
-        .build();
+    private static final long PAGE_LIFETIME_MS = 120_000; // the browser reads the page within moments
 
     /** How the search was opened, for the status line. */
     public enum Result { OPENED, PASTE_FALLBACK }
@@ -43,38 +38,56 @@ public final class ImageSearch {
     public static Result search(String dataUrl) throws IOException {
         byte[] jpeg = decodeDataUrl(dataUrl);
         try {
-            browse(uploadToLens(jpeg));
+            Path page = writeUploadPage(jpeg);
+            browse(page.toUri());
             return Result.OPENED;
         } catch (Exception e) {
-            System.err.println("Lens upload failed, falling back to paste: " + e);
+            System.err.println("Lens upload page failed, falling back to paste: " + e);
             copyImageToClipboard(jpeg);
-            browse(FALLBACK_URL);
+            browse(URI.create(FALLBACK_URL));
             return Result.PASTE_FALLBACK;
         }
     }
 
-    // Posts the image as multipart form data and returns the results URL from the redirect.
-    static String uploadToLens(byte[] jpeg) throws IOException, InterruptedException {
-        String boundary = "----copilot" + UUID.randomUUID().toString().replace("-", "");
-        ByteArrayOutputStream body = new ByteArrayOutputStream();
-        body.write(("--" + boundary + "\r\n"
-            + "Content-Disposition: form-data; name=\"encoded_image\"; filename=\"snap.jpg\"\r\n"
-            + "Content-Type: image/jpeg\r\n\r\n").getBytes(StandardCharsets.UTF_8));
-        body.write(jpeg);
-        body.write(("\r\n--" + boundary + "--\r\n").getBytes(StandardCharsets.UTF_8));
+    // A page that, once opened, puts the image into a file field and submits it to Lens.
+    static Path writeUploadPage(byte[] jpeg) throws IOException {
+        Path page = Files.createTempFile("copilot-lens-", ".html");
+        Files.writeString(page, uploadPageHtml(Base64.getEncoder().encodeToString(jpeg),
+            UPLOAD_URL + System.currentTimeMillis()), StandardCharsets.UTF_8);
+        page.toFile().deleteOnExit();
+        Thread cleanup = new Thread(() -> {
+            try { Thread.sleep(PAGE_LIFETIME_MS); Files.deleteIfExists(page); } catch (Exception ignored) {}
+        }, "lens-page-cleanup");
+        cleanup.setDaemon(true);
+        cleanup.start();
+        return page;
+    }
 
-        HttpRequest req = HttpRequest.newBuilder(URI.create(UPLOAD_URL + System.currentTimeMillis()))
-            .timeout(Duration.ofSeconds(30))
-            .header("User-Agent", USER_AGENT)
-            .header("Content-Type", "multipart/form-data; boundary=" + boundary)
-            .POST(HttpRequest.BodyPublishers.ofByteArray(body.toByteArray()))
-            .build();
-        HttpResponse<Void> res = HTTP.send(req, HttpResponse.BodyHandlers.discarding());
-        String location = res.headers().firstValue("location").orElse(null);
-        if (res.statusCode() / 100 != 3 || location == null || !location.startsWith("https://")) {
-            throw new IOException("unexpected Lens response: HTTP " + res.statusCode());
-        }
-        return location;
+    static String uploadPageHtml(String base64Jpeg, String action) {
+        return """
+            <!doctype html>
+            <html><head><meta charset="utf-8"><title>Searching with Google Lens…</title></head>
+            <body style="font:15px -apple-system,sans-serif;margin:40px;color:#333">
+            <p id="msg">Sending the screenshot to Google Lens…</p>
+            <form id="f" method="POST" enctype="multipart/form-data" action="%s">
+              <input type="file" name="encoded_image" id="img" hidden>
+            </form>
+            <script>
+            try {
+              const bin = atob("%s");
+              const bytes = new Uint8Array(bin.length);
+              for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+              const dt = new DataTransfer();
+              dt.items.add(new File([bytes], "snap.jpg", {type: "image/jpeg"}));
+              document.getElementById("img").files = dt.files;
+              document.getElementById("f").submit();
+            } catch (e) {
+              document.getElementById("msg").textContent =
+                "This browser could not send the screenshot (" + e + "). Open lens.google.com and paste the image instead.";
+            }
+            </script>
+            </body></html>
+            """.formatted(action, base64Jpeg);
     }
 
     static byte[] decodeDataUrl(String dataUrl) throws IOException {
@@ -84,11 +97,11 @@ public final class ImageSearch {
         return Base64.getDecoder().decode(dataUrl.substring(comma + 1));
     }
 
-    private static void browse(String url) throws IOException {
+    private static void browse(URI uri) throws IOException {
         if (Desktop.isDesktopSupported() && Desktop.getDesktop().isSupported(Desktop.Action.BROWSE)) {
-            Desktop.getDesktop().browse(URI.create(url));
+            Desktop.getDesktop().browse(uri);
         } else {
-            new ProcessBuilder("open", url).start();
+            new ProcessBuilder("open", uri.toString()).start();
         }
     }
 
